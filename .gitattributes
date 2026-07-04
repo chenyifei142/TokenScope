@@ -1,0 +1,21 @@
+﻿# Auto detect text files and perform LF normalization
+* text=auto
+
+# Python source files
+*.py text diff=python
+
+# Shell / PowerShell scripts
+*.ps1 text eol=crlf
+
+# Config files
+*.ini text
+*.cfg text
+*.conf text
+*.spec text
+
+# Markdown
+*.md text
+
+# Git files
+.gitignore text
+.gitattributes text
