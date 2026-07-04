@@ -58,6 +58,8 @@ LOWER_CARD_HEIGHT = 128
 STATUS_BAR_HEIGHT = 38
 
 
+# Windows can retain its light native popup background while inheriting the app's
+# light foreground, so menus must define both sides of the contrast explicitly.
 APP_STYLE = f"""
 QWidget {{
     color: {C_TEXT};
@@ -157,6 +159,26 @@ QScrollArea {{ background: transparent; border: 0; }}
 QScrollBar:horizontal {{ background: {C_ROW_BG}; height: 8px; border-radius: 4px; }}
 QScrollBar::handle:horizontal {{ background: {C_DEEP_BLUE}; min-width: 36px; border-radius: 4px; }}
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
+QMenu {{
+    color: {C_TEXT};
+    background: {C_SURFACE};
+    border: 1px solid {C_BORDER};
+    padding: 6px;
+}}
+QMenu::item {{
+    padding: 7px 24px 7px 12px;
+    border-radius: 6px;
+}}
+QMenu::item:selected {{
+    color: {C_VALUE};
+    background: {C_DEEP_BLUE};
+}}
+QMenu::item:disabled {{ color: {C_DISABLED}; }}
+QMenu::separator {{
+    height: 1px;
+    background: {C_DIVIDER};
+    margin: 5px 8px;
+}}
 QToolTip {{
     color: {C_TEXT};
     background: {C_SURFACE};
