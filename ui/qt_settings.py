@@ -6,7 +6,7 @@ selected provider are shown — keeping the dialog small and focused.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Union
+from typing import Any, Callable
 
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import (
@@ -19,7 +19,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
-    QPlainTextEdit,
     QPushButton,
     QSpinBox,
     QVBoxLayout,
@@ -138,13 +137,10 @@ class SettingsWindow(QDialog):
     def _remember_visible_credentials(self) -> None:
         if not self._rendered_provider_id:
             return
-        draft: dict[str, str] = {}
-        for field, widget in self._provider_widgets.items():
-            if isinstance(widget, QPlainTextEdit):
-                draft[field] = widget.toPlainText().strip()
-            else:
-                draft[field] = widget.text().strip()
-        self._provider_drafts[self._rendered_provider_id] = draft
+        self._provider_drafts[self._rendered_provider_id] = {
+            field: widget.text().strip()
+            for field, widget in self._provider_widgets.items()
+        }
 
     def _render_credentials(self, provider_id: str) -> None:
         # Clear any existing widgets.
@@ -174,22 +170,15 @@ class SettingsWindow(QDialog):
             label = str(meta.get("label") or field)
             hint = str(meta.get("hint") or "")
             secret = bool(meta.get("secret"))
-            multiline = bool(meta.get("multiline"))
-            row_widget, edit = self._build_credential_row(label, hint, secret, multiline)
+            row_widget, edit = self._build_credential_row(label, hint, secret)
             key = f"{upper_id}_{field.upper()}"
-            initial = draft.get(field, str(cached.get(key, "")))
-            if isinstance(edit, QPlainTextEdit):
-                edit.setPlainText(initial)
-            else:
-                edit.setText(initial)
+            edit.setText(draft.get(field, str(cached.get(key, ""))))
             self._provider_widgets[field] = edit
             self.credentials_layout.addWidget(row_widget)
         self._rendered_provider_id = provider_id
 
     @staticmethod
-    def _build_credential_row(
-        label: str, hint: str, secret: bool, multiline: bool
-    ) -> tuple[QWidget, Union[QLineEdit, QPlainTextEdit]]:
+    def _build_credential_row(label: str, hint: str, secret: bool) -> tuple[QWidget, QLineEdit]:
         wrapper = QWidget()
         layout = QVBoxLayout(wrapper)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -200,18 +189,13 @@ class SettingsWindow(QDialog):
         input_row = QHBoxLayout()
         input_row.setContentsMargins(0, 0, 0, 0)
         input_row.setSpacing(8)
-        if multiline:
-            editor: Union[QLineEdit, QPlainTextEdit] = QPlainTextEdit()
-            editor.setPlaceholderText("未填写" if not hint else hint)
-            editor.setFixedHeight(96)
-        else:
-            editor = QLineEdit()
-            editor.setPlaceholderText("未填写" if not hint else hint)
-        if secret and isinstance(editor, QLineEdit):
-            editor.setEchoMode(QLineEdit.EchoMode.Password)
-        input_row.addWidget(editor, 1)
+        edit = QLineEdit()
+        edit.setPlaceholderText("未填写" if not hint else hint)
+        if secret:
+            edit.setEchoMode(QLineEdit.EchoMode.Password)
+        input_row.addWidget(edit, 1)
         layout.addLayout(input_row)
-        return wrapper, editor
+        return wrapper, edit
 
     def _load_values(self) -> None:
         values = config_manager.load_config()
