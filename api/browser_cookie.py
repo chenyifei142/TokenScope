@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+import config_manager
+
 
 _CDP_PORT_RANGE = range(9222, 9323)
 _CDP_TIMEOUT_SECONDS = 10
@@ -29,8 +31,7 @@ def normalize_cookie(raw: str) -> str:
 
 
 def default_user_data_dir(profile_name: str) -> str:
-    base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
-    return str(Path(base) / "TokenSpider" / profile_name)
+    return str(config_manager.CONFIG_DIR / profile_name)
 
 
 def find_chrome_executable(use_edge: bool = False) -> str:

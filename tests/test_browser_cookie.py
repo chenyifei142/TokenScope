@@ -5,8 +5,10 @@ from unittest.mock import patch
 
 os.environ["APPDATA"] = str(Path.cwd() / ".test-appdata")
 
+import config_manager
 from api import browser_cookie
 from api.providers.deepseek import DeepSeekProvider
+from api.providers.mimo import MiMoProvider
 
 
 def test_deepseek_cookie_filter_keeps_only_first_party_domains():
@@ -33,6 +35,16 @@ def test_deepseek_cookie_acquisition_keeps_bearer_token_separate():
     assert DeepSeekProvider.acquired_cookie_values(result) == {"COOKIE": "session=active"}
     assert acquire.call_args.kwargs["profile_name"] == "deepseek-chrome"
     assert acquire.call_args.kwargs["allowed_domains"] == ("platform.deepseek.com", "deepseek.com")
+    assert acquire.call_args.kwargs["user_data_dir"] == str(
+        config_manager.CONFIG_DIR / "deepseek-chrome"
+    )
+
+
+def test_browser_profiles_follow_the_active_application_data_directory():
+    custom_dir = Path.cwd() / ".test-appdata" / "custom"
+    with patch.object(config_manager, "CONFIG_DIR", custom_dir):
+        assert browser_cookie.default_user_data_dir("profile") == str(custom_dir / "profile")
+        assert MiMoProvider.default_user_data_dir() == str(custom_dir / "mimo-chrome")
 
 
 def test_required_cookie_validation_rejects_expired_values():

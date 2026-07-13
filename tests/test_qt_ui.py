@@ -34,6 +34,7 @@ from ui.qt_panel import (
     STATUS_SECTION_HEIGHT,
     TOP_SECTION_HEIGHT,
     MainPanel,
+    MinuteUsageChart,
     StatisticsCard,
     TrendCard,
     format_money_axis,
@@ -160,6 +161,57 @@ def test_money_axis_and_zero_cost_range_remain_readable():
     assert trend._values == [0.0] * 7
     assert trend.plot.getViewBox().viewRange()[1][1] >= 0.01
     trend.close()
+
+
+def test_minute_chart_tooltip_legend_and_navigator_preserve_raw_series():
+    chart = MinuteUsageChart()
+    rows = [
+        {"minute": 600, "token_type": "PROMPT_CACHE_HIT_TOKEN", "token_amount": 80},
+        {"minute": 600, "token_type": "PROMPT_CACHE_MISS_TOKEN", "token_amount": 20},
+        {"minute": 600, "token_type": "RESPONSE_TOKEN", "token_amount": 10},
+    ]
+    chart.set_rows(rows, "recorded")
+    chart.show()
+    APP.processEvents()
+
+    tooltip = chart.tooltip_text(600)
+    assert "10:00" in tooltip
+    assert "输入（命中缓存）　80" in tooltip
+    assert "输入（未命中缓存）　20" in tooltip
+    assert "输出　10" in tooltip
+    assert "总计 110" in tooltip
+    assert "缓存命中率　80.0%" in tooltip
+    chart.set_series_visible("RESPONSE_TOKEN", False)
+    assert not chart._fills["RESPONSE_TOKEN"].isVisible()
+    assert chart.tooltip_text(600) == tooltip
+    chart.region.setRegion((480, 720))
+    APP.processEvents()
+    left, right = chart.plot.getViewBox().viewRange()[0]
+    assert left <= 480 <= right
+    assert left <= 720 <= right
+    chart.close()
+
+
+def test_minute_chart_handles_zero_cache_denominator_and_panel_defaults_to_annual():
+    chart = MinuteUsageChart()
+    chart.set_rows(
+        [{"minute": 1, "token_type": "RESPONSE_TOKEN", "token_amount": 1}],
+        "recorded",
+    )
+    assert "缓存命中率　--" in chart.tooltip_text(1)
+    panel = MainPanel()
+    panel.update_data(sample_data())
+    assert panel.activity_stack.currentIndex() == 0
+    assert panel.annual_activity_button.isChecked()
+    panel.minute_activity_button.click()
+    assert panel.activity_stack.currentIndex() == 1
+    assert panel.minute_activity_button.isChecked()
+    assert not panel.minute_estimate_label.isHidden()
+    assert "按刷新间隔均摊" in panel.minute_estimate_label.text()
+    assert not panel.minute_previous_button.isEnabled()
+    assert not panel.minute_next_button.isEnabled()
+    panel.close()
+    chart.close()
 
 
 def test_statistics_show_cached_historical_total_with_scope_tooltip():
@@ -606,6 +658,36 @@ def test_settings_exposes_panel_auto_collapse_toggle():
     assert not window.panel_auto_collapse_check.isChecked()
     window.panel_auto_collapse_check.setChecked(True)
     assert window._values()["PANEL_AUTO_COLLAPSE_ON_DEACTIVATE"] is True
+    window.close()
+
+
+def test_settings_schedules_application_data_directory_change_after_save():
+    values = config_manager.all_config()
+    current = Path.cwd() / ".test-appdata" / "current"
+    target = Path.cwd() / ".test-appdata" / "target"
+    with (
+        patch("ui.qt_settings.config_manager.load_config", return_value=values),
+        patch("ui.qt_settings.config_manager.all_config", return_value=values),
+        patch("ui.qt_settings.config_manager.pending_data_dir", return_value=None),
+        patch("ui.qt_settings.config_manager.data_dir_migration_error", return_value=""),
+        patch.object(config_manager, "CONFIG_DIR", current),
+    ):
+        window = SettingsWindow()
+        window._selected_data_dir = target
+        window.data_dir_edit.setText(str(target))
+        with (
+            patch(
+                "ui.qt_settings.config_manager.validate_data_dir_target",
+                return_value=target.resolve(),
+            ),
+            patch("ui.qt_settings.config_manager.save_config"),
+            patch("ui.qt_settings.config_manager.schedule_data_dir_change") as schedule,
+            patch("ui.qt_settings.QMessageBox.information") as information,
+        ):
+            window._save()
+
+    schedule.assert_called_once_with(target.resolve())
+    information.assert_called_once()
     window.close()
 
 

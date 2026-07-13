@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, ClassVar
+from zoneinfo import ZoneInfo
 
 import api.deepseek as ds  # 兼容 v1.0 中对 data.store.ds 的测试和扩展引用。
 import config_manager
@@ -194,6 +195,43 @@ def _monthly_totals_from_payloads(
     return month_tokens, month_cost, per_model
 
 
+def token_breakdown_for_day(
+    payloads: list[dict[str, Any]], usage_day: date
+) -> dict[str, int] | None:
+    """从已确认的按日接口响应中聚合三类 Token 累计值。"""
+    totals = {token_type: 0 for token_type in TOKEN_TYPES}
+    found_day = False
+    for payload in payloads:
+        for day in payload.get("days", []) or []:
+            if not isinstance(day, dict) or str(day.get("date", "")) != usage_day.isoformat():
+                continue
+            found_day = True
+            for item in day.get("data", []) or []:
+                if not isinstance(item, dict):
+                    continue
+                for usage in item.get("usage", []) or []:
+                    if not isinstance(usage, dict):
+                        continue
+                    token_type = str(usage.get("type", ""))
+                    if token_type not in totals:
+                        continue
+                    totals[token_type] += _safe_int(usage.get("amount"))
+    return totals if found_day else None
+
+
+def provider_observed_at(provider_id: str, observed_at: datetime) -> datetime:
+    """将刷新时刻转换为提供商估算日界所使用的时区。"""
+    if provider_id == "mimo":
+        return observed_at.astimezone(ZoneInfo("Asia/Shanghai"))
+    # DeepSeek 未返回账单时区；按已确认的产品约定使用运行设备本地时区。
+    return observed_at.astimezone()
+
+
+def provider_usage_day(provider_id: str, observed_at: datetime) -> date:
+    """按提供商已确认或用户选择的估算日界返回自然日。"""
+    return provider_observed_at(provider_id, observed_at).date()
+
+
 @dataclass
 class PerProviderData:
     provider_id: str
@@ -235,6 +273,9 @@ class TokenData:
     is_stale: bool = False
     last_updated: str = ""
     daily_usage: list[dict[str, Any]] = field(default_factory=list)
+    minute_usage: list[dict[str, Any]] = field(default_factory=list)
+    minute_usage_status: str = "unavailable"
+    minute_usage_date: str = ""
 
     _last_snapshot: ClassVar["TokenData | None"] = None
     _provider_snapshots: ClassVar[dict[str, "TokenData"]] = {}
@@ -250,7 +291,6 @@ class TokenData:
     def fetch(
         cls, today: date | None = None, lightweight: bool = False
     ) -> "TokenData":
-        current_day = today or date.today()
         providers = list(active_providers())
         if not providers:
             return cls(
@@ -260,6 +300,8 @@ class TokenData:
             )
 
         provider = providers[0]
+        observed_at = provider_observed_at(provider.id, datetime.now().astimezone())
+        current_day = today or observed_at.date()
         cached = cls._base_snapshot(provider.id)
         data = cached
         data.status = "loading"
@@ -273,6 +315,18 @@ class TokenData:
         per.status = "loading"
         per.is_stale = False
         successes = 0
+        minute_rows: list[dict[str, Any]] = []
+        minute_status = "unavailable"
+        if getattr(provider, "supports_estimated_minute_usage", False):
+            try:
+                # 每次启动/刷新均尝试按提供商自然日清理；失败不能影响原有账单刷新。
+                history.clear_expired_minute_usage(provider.id, current_day)
+                minute_rows = history.minute_usage_for_day(provider.id, current_day)
+                minute_status = "empty"
+            except Exception:
+                config_manager.logger().exception("Minute usage cleanup failed for %s", provider.id)
+                per.errors.append(FetchError("LOCAL_STORAGE", "分时缓存", "分钟缓存清理失败"))
+                minute_status = "storage_error"
 
         if not provider.is_configured():
             # 删除或切换凭据后不能继续展示旧账号数据，否则会造成“仍已登录”的错觉。
@@ -364,6 +418,27 @@ class TokenData:
                     config_manager.logger().exception("History save failed for %s", provider.id)
                     per.errors.append(FetchError("LOCAL_STORAGE", "历史缓存", "本地历史保存失败"))
 
+                if getattr(provider, "supports_estimated_minute_usage", False):
+                    token_totals = token_breakdown_for_day(payloads, current_day)
+                    if token_totals is None:
+                        minute_status = "empty"
+                    else:
+                        try:
+                            minute_status = history.save_estimated_minute_usage(
+                                provider.id, current_day, token_totals, observed_at
+                            )
+                            minute_rows = history.minute_usage_for_day(provider.id, current_day)
+                        except Exception:
+                            config_manager.logger().exception(
+                                "Minute usage save failed for %s", provider.id
+                            )
+                            per.errors.append(
+                                FetchError("LOCAL_STORAGE", "分时缓存", "分钟缓存保存失败")
+                            )
+                            minute_status = "storage_error"
+            elif getattr(provider, "supports_estimated_minute_usage", False):
+                minute_status = "failed" if payload_errors else "empty"
+
             try:
                 data.daily_usage = (
                     history.recent_daily(371, provider.id)
@@ -399,6 +474,9 @@ class TokenData:
         data.per_model_amount = copy.deepcopy(per.per_model)
         data.per_model_cost = copy.deepcopy(per.per_model)
         data.errors = list(per.errors)
+        data.minute_usage = minute_rows
+        data.minute_usage_status = minute_status
+        data.minute_usage_date = current_day.isoformat()
 
         if successes:
             data.last_success_at = datetime.now()

@@ -2,6 +2,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
@@ -98,6 +99,102 @@ class HistoryTests(unittest.TestCase):
                 rows = history.recent_daily(30_000, "deepseek")
                 self.assertEqual(rows[0]["tokens"], 12)
                 self.assertEqual(rows[0]["cost_cny"], Decimal(".125"))
+                connection = sqlite3.connect(db_path)
+                try:
+                    tables = {
+                        row[0]
+                        for row in connection.execute(
+                            "SELECT name FROM sqlite_master WHERE type = 'table'"
+                        )
+                    }
+                finally:
+                    connection.close()
+                self.assertIn("minute_usage", tables)
+                self.assertIn("minute_usage_snapshot", tables)
+
+    def test_estimated_minute_usage_distributes_delta_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory(dir=self.temp_root()) as directory:
+            with patch.object(history, "DB_PATH", Path(directory) / "usage.db"):
+                usage_day = date(2026, 7, 13)
+                first = datetime(2026, 7, 13, 10, 0, 10)
+                second = datetime(2026, 7, 13, 10, 3, 10)
+                totals = {
+                    "PROMPT_CACHE_HIT_TOKEN": 3,
+                    "PROMPT_CACHE_MISS_TOKEN": 2,
+                    "RESPONSE_TOKEN": 1,
+                }
+                self.assertEqual(
+                    history.save_estimated_minute_usage("mimo", usage_day, totals, first),
+                    "baseline",
+                )
+                totals["PROMPT_CACHE_HIT_TOKEN"] = 8
+                totals["PROMPT_CACHE_MISS_TOKEN"] = 5
+                self.assertEqual(
+                    history.save_estimated_minute_usage("mimo", usage_day, totals, second),
+                    "recorded",
+                )
+                rows = history.minute_usage_for_day("mimo", usage_day)
+                by_type = {}
+                for row in rows:
+                    by_type[row["token_type"]] = by_type.get(row["token_type"], 0) + row["token_amount"]
+                self.assertEqual(by_type["PROMPT_CACHE_HIT_TOKEN"], 5)
+                self.assertEqual(by_type["PROMPT_CACHE_MISS_TOKEN"], 3)
+                self.assertNotIn("RESPONSE_TOKEN", by_type)
+                self.assertEqual(
+                    history.save_estimated_minute_usage("mimo", usage_day, totals, second),
+                    "unchanged",
+                )
+                self.assertEqual(history.minute_usage_for_day("mimo", usage_day), rows)
+
+    def test_minute_cleanup_keeps_daily_history_and_rolls_back_on_failure(self):
+        with tempfile.TemporaryDirectory(dir=self.temp_root()) as directory:
+            with patch.object(history, "DB_PATH", Path(directory) / "usage.db"):
+                old_day = date(2026, 7, 12)
+                current_day = date(2026, 7, 13)
+                totals = {token_type: 0 for token_type in history.MINUTE_TOKEN_TYPES}
+                history.save_estimated_minute_usage(
+                    "deepseek", old_day, totals, datetime(2026, 7, 12, 10, 0)
+                )
+                totals["RESPONSE_TOKEN"] = 4
+                history.save_estimated_minute_usage(
+                    "deepseek", old_day, totals, datetime(2026, 7, 12, 10, 1)
+                )
+                history.save_usage([payload(old_day.isoformat(), 12)], [])
+                current_totals = {token_type: 0 for token_type in history.MINUTE_TOKEN_TYPES}
+                history.save_estimated_minute_usage(
+                    "deepseek", current_day, current_totals, datetime(2026, 7, 13, 10, 0)
+                )
+                current_totals["RESPONSE_TOKEN"] = 2
+                history.save_estimated_minute_usage(
+                    "deepseek", current_day, current_totals, datetime(2026, 7, 13, 10, 1)
+                )
+                history.clear_expired_minute_usage("deepseek", current_day)
+                self.assertEqual(history.minute_usage_for_day("deepseek", old_day), [])
+                self.assertTrue(history.minute_usage_for_day("deepseek", current_day))
+                self.assertEqual(history.recent_daily(30_000)[0]["tokens"], 12)
+
+                # 第二个 DELETE 触发失败时，第一个 DELETE 也必须由事务回滚。
+                history.save_estimated_minute_usage(
+                    "deepseek", old_day, totals, datetime(2026, 7, 12, 10, 2)
+                )
+                totals["RESPONSE_TOKEN"] = 5
+                history.save_estimated_minute_usage(
+                    "deepseek", old_day, totals, datetime(2026, 7, 12, 10, 3)
+                )
+                connection = sqlite3.connect(history.DB_PATH)
+                try:
+                    connection.execute(
+                        """CREATE TRIGGER abort_snapshot_cleanup
+                             BEFORE DELETE ON minute_usage_snapshot
+                             WHEN OLD.provider = 'deepseek'
+                             BEGIN SELECT RAISE(ABORT, 'test rollback'); END"""
+                    )
+                    connection.commit()
+                finally:
+                    connection.close()
+                with self.assertRaises(sqlite3.DatabaseError):
+                    history.clear_expired_minute_usage("deepseek", current_day)
+                self.assertTrue(history.minute_usage_for_day("deepseek", old_day))
 
 
 if __name__ == "__main__":

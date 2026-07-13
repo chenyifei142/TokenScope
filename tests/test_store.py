@@ -1,6 +1,6 @@
 import os
 import unittest
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
@@ -8,7 +8,15 @@ from unittest.mock import patch
 os.environ["APPDATA"] = str(Path.cwd() / ".test-appdata")
 
 from api.providers.base import FetchError, ModelUsage, ProviderBalance, ProviderSummary
-from data.store import TokenData, months_for_activity, months_for_week, top_model_stats
+from data.store import (
+    TokenData,
+    months_for_activity,
+    months_for_week,
+    provider_usage_day,
+    provider_observed_at,
+    token_breakdown_for_day,
+    top_model_stats,
+)
 
 
 def payload(day, tokens, cost="0", model="deepseek-test"):
@@ -167,6 +175,40 @@ class StoreTests(unittest.TestCase):
         })
         data = self.fetch_with(FakeProvider(payloads=[bad]))
         self.assertEqual(data.today_tokens, 4)
+
+    def test_today_token_breakdown_keeps_all_three_real_token_types(self):
+        raw = payload("2026-07-03", 0)
+        raw["days"][0]["data"][0]["usage"] = [
+            {"type": "PROMPT_CACHE_HIT_TOKEN", "amount": 8},
+            {"type": "PROMPT_CACHE_MISS_TOKEN", "amount": 3},
+            {"type": "RESPONSE_TOKEN", "amount": 2},
+        ]
+        self.assertEqual(token_breakdown_for_day([raw], date(2026, 7, 3)), {
+            "PROMPT_CACHE_HIT_TOKEN": 8,
+            "PROMPT_CACHE_MISS_TOKEN": 3,
+            "RESPONSE_TOKEN": 2,
+        })
+        self.assertIsNone(token_breakdown_for_day([raw], date(2026, 7, 4)))
+
+    def test_provider_usage_day_uses_mimo_shanghai_and_deepseek_local_time(self):
+        observed = datetime(2026, 7, 13, 16, 30, tzinfo=timezone.utc)
+        self.assertEqual(provider_usage_day("mimo", observed), date(2026, 7, 14))
+        self.assertEqual(provider_observed_at("mimo", observed).hour, 0)
+        self.assertEqual(provider_usage_day("deepseek", observed), observed.astimezone().date())
+
+    def test_minute_cache_failure_does_not_block_daily_usage_refresh(self):
+        provider = FakeProvider(payloads=[payload("2026-07-03", 7, ".2")])
+        provider.supports_estimated_minute_usage = True
+        with (
+            patch("data.store.history.clear_expired_minute_usage", side_effect=OSError("locked")),
+            patch("data.store.history.minute_usage_for_day", return_value=[]),
+            patch("data.store.history.save_estimated_minute_usage", return_value="baseline"),
+        ):
+            data = self.fetch_with(provider)
+        self.assertEqual(data.today_tokens, 7)
+        self.assertEqual(data.minute_usage_status, "baseline")
+        self.assertEqual(data.status, "partial")
+        self.assertIn("LOCAL_STORAGE", {error.code for error in data.errors})
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QHBoxLayout,
@@ -200,6 +201,26 @@ class SettingsWindow(QDialog):
             "点击其它应用使面板失焦时收起面板并显示悬浮球"
         )
         runtime_form.addRow("面板自动收起", self.panel_auto_collapse_check)
+        data_dir_row = QWidget()
+        data_dir_layout = QHBoxLayout(data_dir_row)
+        data_dir_layout.setContentsMargins(0, 0, 0, 0)
+        data_dir_layout.setSpacing(8)
+        self.data_dir_edit = QLineEdit()
+        self.data_dir_edit.setReadOnly(True)
+        self.data_dir_edit.setToolTip("配置、数据库、日志、更新缓存和专用浏览器会话的保存目录")
+        self.data_dir_browse_button = QPushButton("选择…")
+        self.data_dir_browse_button.clicked.connect(self._choose_data_dir)
+        self.data_dir_default_button = QPushButton("恢复默认")
+        self.data_dir_default_button.clicked.connect(self._restore_default_data_dir)
+        data_dir_layout.addWidget(self.data_dir_edit, 1)
+        data_dir_layout.addWidget(self.data_dir_browse_button)
+        data_dir_layout.addWidget(self.data_dir_default_button)
+        runtime_form.addRow("应用数据目录", data_dir_row)
+        self.data_dir_status = QLabel()
+        self.data_dir_status.setWordWrap(True)
+        self.data_dir_status.setProperty("tone", "muted")
+        self.data_dir_status.setStyleSheet("font-size: 12px;")
+        runtime_form.addRow("", self.data_dir_status)
         runtime_layout.addStretch(1)
         self.tabs.addTab(runtime_page, "运行行为")
 
@@ -606,6 +627,24 @@ class SettingsWindow(QDialog):
         self.panel_auto_collapse_check.setChecked(
             bool(values.get("PANEL_AUTO_COLLAPSE_ON_DEACTIVATE", True))
         )
+        selected_data_dir = config_manager.pending_data_dir() or config_manager.CONFIG_DIR
+        self._selected_data_dir = selected_data_dir
+        self.data_dir_edit.setText(str(selected_data_dir))
+        migration_error = config_manager.data_dir_migration_error()
+        if migration_error:
+            self._set_feedback(
+                self.data_dir_status,
+                f"上次迁移失败，仍在使用原目录：{migration_error}",
+                "danger",
+            )
+        elif config_manager.pending_data_dir() is not None:
+            self._set_feedback(
+                self.data_dir_status, "目录变更将在重启后执行。", "muted"
+            )
+        else:
+            self._set_feedback(
+                self.data_dir_status, "更改后需重启；迁移完成前不会删除原目录。", "muted"
+            )
         self.auto_check_updates.setChecked(bool(values.get("UPDATE_AUTO_CHECK_ENABLED", True)))
         update_channel = str(values.get("UPDATE_CHANNEL", "stable"))
         update_index = max(0, self.update_channel_combo.findData(update_channel))
@@ -661,6 +700,27 @@ class SettingsWindow(QDialog):
             return
         self.update_controller.skip_available_version(self)
 
+    def _choose_data_dir(self) -> None:
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "选择应用数据目录",
+            str(self._selected_data_dir),
+        )
+        if not selected:
+            return
+        self._selected_data_dir = selected
+        self.data_dir_edit.setText(str(self._selected_data_dir))
+        self._set_feedback(
+            self.data_dir_status, "保存后将在下次启动时迁移全部应用数据。", "muted"
+        )
+
+    def _restore_default_data_dir(self) -> None:
+        self._selected_data_dir = config_manager.DEFAULT_CONFIG_DIR.resolve(strict=False)
+        self.data_dir_edit.setText(str(self._selected_data_dir))
+        self._set_feedback(
+            self.data_dir_status, "保存后将在下次启动时恢复默认目录。", "muted"
+        )
+
     def _save(self) -> None:
         values = self._values()
         for key, value in values.items():
@@ -673,10 +733,31 @@ class SettingsWindow(QDialog):
                 if result != QMessageBox.StandardButton.Yes:
                     return
         try:
+            selected_data_dir = config_manager.validate_data_dir_target(
+                self._selected_data_dir
+            )
+        except (OSError, ValueError) as exc:
+            self._set_feedback(self.save_feedback, f"应用数据目录不可用：{exc}", "danger")
+            return
+        try:
             config_manager.save_config(values)
         except Exception as exc:
             self._set_feedback(self.save_feedback, f"保存失败，配置已回滚：{exc}", "danger")
             return
+        scheduled_data_dir = (
+            config_manager.pending_data_dir() or config_manager.CONFIG_DIR
+        ).resolve(strict=False)
+        data_dir_changed = selected_data_dir != scheduled_data_dir
+        if data_dir_changed:
+            try:
+                config_manager.schedule_data_dir_change(selected_data_dir)
+            except (OSError, ValueError) as exc:
+                self._set_feedback(
+                    self.save_feedback,
+                    f"配置已保存，但应用数据目录变更失败：{exc}",
+                    "danger",
+                )
+                return
         active_id = str(values.get("ACTIVE_PROVIDER", ""))
         self._set_feedback(
             self.save_feedback,
@@ -687,6 +768,12 @@ class SettingsWindow(QDialog):
             self.update_controller.reload_cached_release()
         if self.on_saved:
             self.on_saved()
+        if data_dir_changed:
+            QMessageBox.information(
+                self,
+                "重启后迁移",
+                "全部应用数据将在下次启动时迁移。迁移成功后才会切换目录，原目录会保留。",
+            )
 
     def _test_connection(self) -> None:
         try:

@@ -234,6 +234,8 @@ QLabel[tone="warning"] {{ color: {tokens.warning}; }}
 QLabel[tone="danger"] {{ color: {tokens.danger}; }}
 QLabel#sectionTitle {{ color: {tokens.value}; font-size: 14px; font-weight: 700; }}
 QLabel#statusText {{ color: {tokens.muted}; font-size: 11px; }}
+QLabel#minuteUsageState {{ color: {tokens.subtext}; font-size: 12px; }}
+QLabel#minuteDateLabel {{ color: {tokens.subtext}; font-size: 11px; }}
 QFrame#divider {{ background: {divider_color}; border: 0; }}
 QWidget#statusBar {{ border-top: 1px solid {divider_color}; }}
 QPushButton, QToolButton {{
@@ -293,6 +295,43 @@ QToolButton#themeButton {{
 QToolButton#themeButton[selected="true"] {{
     color: {tokens.value};
     background: {tokens.accent_soft};
+}}
+QToolButton#activityModeButton {{
+    min-height: 24px;
+    padding: 0 9px;
+    color: {tokens.subtext};
+    background: transparent;
+    border: 1px solid {tokens.border};
+    border-radius: 6px;
+}}
+QToolButton#activityModeButton:checked {{
+    color: {tokens.value};
+    background: {tokens.accent};
+    border-color: {tokens.accent};
+}}
+QToolButton#minuteDateButton {{
+    min-width: 20px;
+    max-width: 20px;
+    min-height: 22px;
+    max-height: 22px;
+    padding: 0;
+    background: transparent;
+    border: 1px solid {tokens.border};
+    border-radius: 5px;
+}}
+QToolButton#minuteLegendButton {{
+    min-height: 22px;
+    padding: 0 4px;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    font-size: 11px;
+}}
+QToolButton#minuteLegendButton:checked {{
+    border-color: {tokens.border};
+}}
+QToolButton#minuteLegendButton:!checked {{
+    color: {tokens.disabled};
 }}
 QPushButton#primaryButton {{
     color: white;

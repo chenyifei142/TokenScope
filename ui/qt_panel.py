@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QScrollArea,
+    QStackedWidget,
     QStyle,
     QToolButton,
     QToolTip,
@@ -63,6 +64,11 @@ def format_money_axis(value: float) -> str:
 class MoneyAxis(pg.AxisItem):
     def tickStrings(self, values, scale, spacing):
         return [format_money_axis(value * scale) for value in values]
+
+
+class TokenAxis(pg.AxisItem):
+    def tickStrings(self, values, scale, spacing):
+        return [format_token_axis(value * scale) for value in values]
 
 
 class DraggableHeader(QFrame):
@@ -333,6 +339,283 @@ class TrendCard(QFrame):
         )
 
 
+class MinuteUsageChart(QWidget):
+    """当天 Token 差额的估算分时图；原始分钟数据始终保持不变。"""
+
+    SERIES = (
+        ("PROMPT_CACHE_HIT_TOKEN", "输入（命中缓存）"),
+        ("PROMPT_CACHE_MISS_TOKEN", "输入（未命中缓存）"),
+        ("RESPONSE_TOKEN", "输出"),
+    )
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("minuteUsageChart")
+        self._values = {key: [0] * 1440 for key, _label in self.SERIES}
+        self._visible = {key: True for key, _label in self.SERIES}
+        self._signature: tuple | None = None
+        self._updating_region = False
+        self._fills: dict[str, pg.FillBetweenItem] = {}
+        self._curves: dict[str, pg.PlotDataItem] = {}
+        self._total_curve: pg.PlotDataItem | None = None
+        self._nav_curve: pg.PlotDataItem | None = None
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        self.state_label = QLabel("等待首次刷新建立估算基线")
+        self.state_label.setObjectName("minuteUsageState")
+        self.state_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.state_label, 1)
+
+        self.chart_container = QWidget()
+        chart_layout = QVBoxLayout(self.chart_container)
+        chart_layout.setContentsMargins(0, 0, 0, 0)
+        chart_layout.setSpacing(1)
+        self.plot = pg.PlotWidget(axisItems={"left": TokenAxis(orientation="left")})
+        self.plot.setStyleSheet("border: 0;")
+        self.plot.setMouseEnabled(x=True, y=False)
+        self.plot.hideButtons()
+        self.plot.setMenuEnabled(False)
+        self.plot.showGrid(x=False, y=True, alpha=0.14)
+        self.plot.setMinimumHeight(82)
+        self.plot.getViewBox().setLimits(xMin=0, xMax=1439, yMin=0)
+        self.plot.getAxis("left").setWidth(42)
+        self.plot.getAxis("left").setTickFont(QFont("Microsoft YaHei UI", 8))
+        self.plot.getAxis("bottom").setHeight(18)
+        self.plot.getAxis("bottom").setTickFont(QFont("Microsoft YaHei UI", 8))
+        self.plot.getAxis("bottom").setTicks(
+            [[(minute, f"{minute // 60:02d}:00") for minute in range(0, 1440, 240)]]
+        )
+        chart_layout.addWidget(self.plot, 1)
+
+        self.navigator = pg.PlotWidget()
+        self.navigator.setStyleSheet("border: 0;")
+        self.navigator.setFixedHeight(25)
+        self.navigator.setMouseEnabled(x=False, y=False)
+        self.navigator.hideButtons()
+        self.navigator.setMenuEnabled(False)
+        self.navigator.getAxis("left").hide()
+        self.navigator.getAxis("bottom").setHeight(15)
+        self.navigator.getAxis("bottom").setTickFont(QFont("Microsoft YaHei UI", 7))
+        self.navigator.getAxis("bottom").setTicks(
+            [[(minute, f"{minute // 60:02d}:00") for minute in range(0, 1441, 360)]]
+        )
+        self.navigator.getViewBox().setLimits(xMin=0, xMax=1439, yMin=0)
+        self.region = pg.LinearRegionItem(values=(0, 1439), movable=True)
+        self.region.sigRegionChanged.connect(self._on_region_changed)
+        self.navigator.addItem(self.region)
+        chart_layout.addWidget(self.navigator)
+        layout.addWidget(self.chart_container, 1)
+        self.chart_container.hide()
+        self._mouse_proxy = pg.SignalProxy(
+            self.plot.scene().sigMouseMoved, rateLimit=60, slot=self._on_mouse_moved
+        )
+        self.plot.getViewBox().sigXRangeChanged.connect(self._on_main_range_changed)
+        try:
+            theme_controller().changed.connect(self._on_theme_changed)
+        except RuntimeError:
+            pass
+
+    @staticmethod
+    def _colors() -> tuple[QColor, QColor, QColor]:
+        tokens = current_theme()
+        hit = QColor(tokens.accent).lighter(155)
+        miss = QColor(tokens.accent)
+        output = QColor(tokens.accent).darker(135)
+        return hit, miss, output
+
+    def legend_color(self, token_type: str) -> QColor:
+        return dict(zip((key for key, _label in self.SERIES), self._colors()))[token_type]
+
+    def set_rows(self, rows: list[dict], status: str, loading: bool = False) -> None:
+        values = {key: [0] * 1440 for key, _label in self.SERIES}
+        for row in rows:
+            try:
+                minute = int(row.get("minute", -1))
+            except (TypeError, ValueError):
+                continue
+            token_type = str(row.get("token_type", ""))
+            if not 0 <= minute < 1440 or token_type not in values:
+                continue
+            values[token_type][minute] += max(0, int(row.get("token_amount", 0) or 0))
+        signature = (status, tuple(tuple(values[key]) for key, _label in self.SERIES))
+        self._values = values
+        if loading and not rows:
+            self._show_state("正在刷新分时估算数据…")
+            return
+        if status == "baseline":
+            self._show_state("已建立估算基线，下一次刷新后显示分时数据")
+            return
+        if status == "cross_day":
+            self._show_state("已跨日重建估算基线，下一次刷新后显示分时数据")
+            return
+        if status == "unavailable":
+            self._show_state("当前平台未启用估算分时数据")
+            return
+        if status in {"failed", "storage_error"} and not rows:
+            self._show_state("分时数据暂不可用，请刷新后重试")
+            return
+        if not any(sum(values[key]) for key, _label in self.SERIES):
+            self._show_state("今日暂无已收集的 Token 分时数据")
+            return
+        self.state_label.hide()
+        self.chart_container.show()
+        if signature != self._signature:
+            self._signature = signature
+            self._render_series()
+
+    def _show_state(self, message: str) -> None:
+        self.state_label.setText(message)
+        self.state_label.show()
+        self.chart_container.hide()
+
+    def _render_series(self) -> None:
+        x = list(range(1440))
+        hit = self._values["PROMPT_CACHE_HIT_TOKEN"]
+        miss = self._values["PROMPT_CACHE_MISS_TOKEN"]
+        output = self._values["RESPONSE_TOKEN"]
+        cumulative = [hit[index] + miss[index] for index in x]
+        total = [cumulative[index] + output[index] for index in x]
+        self.plot.clear()
+        self.navigator.clear()
+        self._fills = {}
+        self._curves = {}
+        zero_curve = pg.PlotDataItem(x, [0] * 1440, pen=None)
+        hit_curve = pg.PlotDataItem(x, hit)
+        miss_curve = pg.PlotDataItem(x, cumulative)
+        output_curve = pg.PlotDataItem(x, total)
+        curves = (hit_curve, miss_curve, output_curve)
+        previous = zero_curve
+        for (token_type, _label), curve in zip(self.SERIES, curves):
+            fill = pg.FillBetweenItem(previous, curve)
+            self.plot.addItem(fill)
+            self.plot.addItem(curve)
+            self._fills[token_type] = fill
+            self._curves[token_type] = curve
+            previous = curve
+        self._total_curve = pg.PlotDataItem(x, total)
+        self.plot.addItem(self._total_curve)
+        self._nav_curve = pg.PlotDataItem(x, total)
+        self.navigator.addItem(self._nav_curve)
+        self.navigator.addItem(self.region)
+        maximum = max(total, default=0)
+        self.plot.setYRange(0, max(1, maximum * 1.08), padding=0)
+        self.navigator.setYRange(0, max(1, maximum * 1.08), padding=0)
+        self.plot.setXRange(0, 1439, padding=0)
+        self.navigator.setXRange(0, 1439, padding=0)
+        self.refresh_theme()
+        self._apply_visibility()
+
+    def refresh_theme(self) -> None:
+        tokens = current_theme()
+        for widget in (self.plot, self.navigator):
+            widget.setBackground(tokens.window)
+            for axis_name in ("left", "bottom"):
+                axis = widget.getAxis(axis_name)
+                axis.setTextPen(pg.mkPen(tokens.subtext))
+                border = QColor(tokens.border)
+                border.setAlpha(96)
+                axis.setPen(pg.mkPen(border))
+        colors = self._colors()
+        for ((token_type, _label), color) in zip(self.SERIES, colors):
+            fill = self._fills.get(token_type)
+            curve = self._curves.get(token_type)
+            if fill is not None:
+                brush = QColor(color)
+                brush.setAlpha(118)
+                fill.setBrush(pg.mkBrush(brush))
+            if curve is not None:
+                curve.setPen(pg.mkPen(color, width=1.0))
+        if self._total_curve is not None:
+            self._total_curve.setPen(pg.mkPen(tokens.accent_hover, width=1.5))
+        if self._nav_curve is not None:
+            self._nav_curve.setPen(pg.mkPen(tokens.accent, width=0.9))
+        self.region.setBrush(pg.mkBrush(QColor(tokens.accent_soft)))
+        for line in self.region.lines:
+            line.setPen(pg.mkPen(tokens.accent, width=1.0))
+
+    def set_series_visible(self, token_type: str, visible: bool) -> None:
+        if token_type not in self._visible:
+            return
+        self._visible[token_type] = visible
+        self._apply_visibility()
+
+    def _apply_visibility(self) -> None:
+        for token_type, visible in self._visible.items():
+            if token_type in self._fills:
+                self._fills[token_type].setVisible(visible)
+            if token_type in self._curves:
+                self._curves[token_type].setVisible(visible)
+
+    def _on_region_changed(self) -> None:
+        if self._updating_region:
+            return
+        low, high = self.region.getRegion()
+        self._updating_region = True
+        try:
+            self.plot.setXRange(low, high, padding=0)
+        finally:
+            self._updating_region = False
+
+    def _on_main_range_changed(self, _view_box, ranges) -> None:
+        if self._updating_region:
+            return
+        x_range = ranges[0] if isinstance(ranges[0], (tuple, list)) else ranges
+        low, high = x_range
+        self._updating_region = True
+        try:
+            self.region.setRegion((max(0, low), min(1439, high)))
+        finally:
+            self._updating_region = False
+
+    def _on_theme_changed(self, _mode: str, _resolved: str) -> None:
+        self.refresh_theme()
+
+    def _on_mouse_moved(self, event) -> None:
+        scene_pos = event[0]
+        if not self.plot.sceneBoundingRect().contains(scene_pos):
+            QToolTip.hideText()
+            return
+        point = self.plot.getViewBox().mapSceneToView(scene_pos)
+        minute = int(round(point.x()))
+        if not 0 <= minute < 1440:
+            QToolTip.hideText()
+            return
+        local = self.plot.mapFromScene(scene_pos)
+        QToolTip.showText(
+            self.plot.mapToGlobal(local), self.tooltip_text(minute), self.plot
+        )
+
+    def tooltip_text(self, minute: int) -> str:
+        hit = self._values["PROMPT_CACHE_HIT_TOKEN"][minute]
+        miss = self._values["PROMPT_CACHE_MISS_TOKEN"][minute]
+        output = self._values["RESPONSE_TOKEN"][minute]
+        total = hit + miss + output
+        rate = "--" if hit + miss == 0 else f"{hit / (hit + miss) * 100:.1f}%"
+        return (
+            f"{minute // 60:02d}:{minute % 60:02d}　总计 {total:,}\n"
+            f"■ 输入（命中缓存）　{hit:,}\n"
+            f"■ 输入（未命中缓存）　{miss:,}\n"
+            f"■ 输出　{output:,}\n"
+            f"缓存命中率　{rate}"
+        )
+
+    def summary_text(self) -> str:
+        hit = sum(self._values["PROMPT_CACHE_HIT_TOKEN"])
+        miss = sum(self._values["PROMPT_CACHE_MISS_TOKEN"])
+        output = sum(self._values["RESPONSE_TOKEN"])
+        total = hit + miss + output
+        if not total:
+            return "暂无估算数据"
+        peak = max(
+            range(1440),
+            key=lambda minute: sum(self._values[key][minute] for key, _label in self.SERIES),
+        )
+        rate = "--" if hit + miss == 0 else f"{hit / (hit + miss) * 100:.1f}%"
+        return f"今日 {compact_tokens(total)} · 命中 {rate} · 峰值 {peak // 60:02d}:{peak % 60:02d}"
+
+
 class StatisticsCard(QFrame):
     """Five equal columns matching the selected third-direction mockup."""
 
@@ -567,10 +850,59 @@ class MainPanel(QFrame):
         activity_header.setSpacing(8)
         activity_title = QLabel("Token 活动")
         activity_title.setObjectName("sectionTitle")
+        self.activity_mode_group = QButtonGroup(self)
+        self.activity_mode_group.setExclusive(True)
+        self.annual_activity_button = self._activity_mode_button("年度活动", True)
+        self.minute_activity_button = self._activity_mode_button("今日分时", False)
+        self.activity_mode_group.addButton(self.annual_activity_button)
+        self.activity_mode_group.addButton(self.minute_activity_button)
+        self.annual_activity_button.clicked.connect(lambda: self._set_activity_view("annual"))
+        self.minute_activity_button.clicked.connect(lambda: self._set_activity_view("minute"))
+        self.minute_previous_button = self._minute_date_button("‹", "前一天（仅缓存当天估算数据）")
+        self.minute_date_label = QLabel("今天")
+        self.minute_date_label.setObjectName("minuteDateLabel")
+        self.minute_next_button = self._minute_date_button("›", "后一天不可选择")
+        self.minute_previous_button.setEnabled(False)
+        self.minute_next_button.setEnabled(False)
+        self.minute_date_label.setToolTip("估算分时仅保存当天数据")
+        self.minute_controls: list[QWidget] = [
+            self.minute_previous_button,
+            self.minute_date_label,
+            self.minute_next_button,
+        ]
+        self.minute_estimate_label = QLabel("估算（按刷新间隔均摊）")
+        self.minute_estimate_label.setObjectName("muted")
+        self.minute_estimate_label.setToolTip("按两次成功刷新之间的累计 Token 差额均摊，非平台原始分钟明细")
         self.activity_summary = QLabel("暂无 Token 活动")
         self.activity_summary.setObjectName("muted")
         activity_header.addWidget(activity_title)
+        activity_header.addWidget(self.annual_activity_button)
+        activity_header.addWidget(self.minute_activity_button)
+        for control in self.minute_controls:
+            activity_header.addWidget(control)
+            control.hide()
+        activity_header.addWidget(self.minute_estimate_label)
+        self.minute_estimate_label.hide()
         activity_header.addStretch(1)
+        self.minute_legend_buttons: dict[str, QToolButton] = {}
+        legend_text = {
+            "PROMPT_CACHE_HIT_TOKEN": "命中缓存",
+            "PROMPT_CACHE_MISS_TOKEN": "未命中",
+            "RESPONSE_TOKEN": "输出",
+        }
+        for token_type, label in MinuteUsageChart.SERIES:
+            button = QToolButton()
+            button.setObjectName("minuteLegendButton")
+            button.setText(legend_text[token_type])
+            button.setCheckable(True)
+            button.setChecked(True)
+            button.setToolTip(f"显示/隐藏{label}（不改变原始估算数据）")
+            button.clicked.connect(
+                lambda checked, value=token_type: self.minute_chart.set_series_visible(value, checked)
+            )
+            self.minute_legend_buttons[token_type] = button
+            activity_header.addWidget(button)
+            button.hide()
         activity_header.addWidget(self.activity_summary)
         activity_layout.addLayout(activity_header)
 
@@ -585,7 +917,13 @@ class MainPanel(QFrame):
         self._fit_activity_heatmap()
         self.activity_scroll.setWidget(self.activity)
         self.activity_scroll.setFixedHeight(self.activity.height())
-        activity_layout.addWidget(self.activity_scroll)
+        self.minute_chart = MinuteUsageChart()
+        self.minute_chart.setFixedHeight(self.activity_scroll.height())
+        self.activity_stack = QStackedWidget()
+        self.activity_stack.setObjectName("activityStack")
+        self.activity_stack.addWidget(self.activity_scroll)
+        self.activity_stack.addWidget(self.minute_chart)
+        activity_layout.addWidget(self.activity_stack)
         content.addWidget(self.activity_card)
         self.middle_section = self.activity_card
 
@@ -621,6 +959,7 @@ class MainPanel(QFrame):
             # not own application startup; the desktop app configures this first.
             pass
         self._refresh_icons()
+        self._set_activity_view("annual")
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -641,6 +980,44 @@ class MainPanel(QFrame):
         )
         self.activity.setMinimumWidth(required_width)
         self.activity.update()
+
+    def _activity_mode_button(self, text: str, checked: bool) -> QToolButton:
+        button = QToolButton()
+        button.setObjectName("activityModeButton")
+        button.setText(text)
+        button.setCheckable(True)
+        button.setChecked(checked)
+        button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        return button
+
+    def _minute_date_button(self, text: str, tooltip: str) -> QToolButton:
+        button = QToolButton()
+        button.setObjectName("minuteDateButton")
+        button.setText(text)
+        button.setToolTip(tooltip)
+        button.setAccessibleName(tooltip)
+        button.setFixedSize(20, 22)
+        return button
+
+    def _set_activity_view(self, view: str) -> None:
+        minute_view = view == "minute"
+        self.activity_stack.setCurrentIndex(1 if minute_view else 0)
+        self.annual_activity_button.setChecked(not minute_view)
+        self.minute_activity_button.setChecked(minute_view)
+        self.activity_summary.setVisible(not minute_view)
+        for control in self.minute_controls:
+            control.setVisible(minute_view)
+        self.minute_estimate_label.setVisible(minute_view)
+        for button in self.minute_legend_buttons.values():
+            button.setVisible(minute_view)
+        self._refresh_minute_control_colors()
+
+    def _refresh_minute_control_colors(self) -> None:
+        if not hasattr(self, "minute_chart"):
+            return
+        for token_type, button in self.minute_legend_buttons.items():
+            color = self.minute_chart.legend_color(token_type).name()
+            button.setStyleSheet(f"color: {color};")
 
     def _theme_button(self, icon_name: str, mode: str, tooltip: str) -> QToolButton:
         button = QToolButton()
@@ -724,6 +1101,8 @@ class MainPanel(QFrame):
     def _on_theme_changed(self, mode: str, resolved: str) -> None:
         self.set_theme_mode(mode, resolved)
         self.status_dot.refresh_theme()
+        self.minute_chart.refresh_theme()
+        self._refresh_minute_control_colors()
         self._refresh_icons()
         self.update()
 
@@ -775,6 +1154,22 @@ class MainPanel(QFrame):
             else:
                 summary = f"过去 12 个月共使用 {compact_tokens(total)}"
         self.activity_summary.setText(summary)
+
+        minute_date = f"今天 {data.minute_usage_date[5:]}" if len(data.minute_usage_date) == 10 else "今天"
+        minute_hint = {
+            "failed": "（刷新失败）",
+            "storage_error": "（缓存失败）",
+            "adjusted": "（平台已校正）",
+        }.get(data.minute_usage_status, "")
+        self.minute_date_label.setText(f"{minute_date}{minute_hint}")
+        self.minute_chart.set_rows(
+            data.minute_usage,
+            data.minute_usage_status,
+            loading=loading,
+        )
+        for button in self.minute_legend_buttons.values():
+            button.setEnabled(data.minute_usage_status != "unavailable")
+        self._refresh_minute_control_colors()
 
         self.trend.set_rows(data.daily_usage)
         self.statistics.set_data(data)

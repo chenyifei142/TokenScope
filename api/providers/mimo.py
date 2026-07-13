@@ -69,6 +69,7 @@ class MiMoProvider(Provider):
     # 与 DeepSeek 一致聚合 today_cost_cny / today_tokens / daily_usage。
     supports_daily_usage = True
     supports_cost = True
+    supports_estimated_minute_usage = True
     supports_cookie_acquisition = True
     credential_fields = {
         "COOKIE": {
@@ -149,8 +150,7 @@ class MiMoProvider(Provider):
     @staticmethod
     def default_user_data_dir() -> str:
         """返回浏览器独立用户数据目录（默认 ``%APPDATA%/TokenSpider/mimo-chrome``）。"""
-        base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
-        return str(Path(base) / "TokenSpider" / "mimo-chrome")
+        return str(config_manager.CONFIG_DIR / "mimo-chrome")
 
     @staticmethod
     def find_chrome_executable(use_edge: bool = False) -> str:
@@ -492,7 +492,7 @@ class MiMoProvider(Provider):
             cookie_names=MIMO_ACQUIRE_KEYS,
             empty_cookie_error="MIMO_COOKIE_EMPTY",
             use_edge=use_edge,
-            user_data_dir=user_data_dir,
+            user_data_dir=user_data_dir or MiMoProvider.default_user_data_dir(),
             auto_collect=auto_collect,
             headless=headless,
             total_timeout_seconds=total_timeout_seconds,

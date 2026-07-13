@@ -105,6 +105,7 @@ class DeepSeekProvider(Provider):
     official_api_hosts = {"platform.deepseek.com", "api.deepseek.com"}
     supports_daily_usage = True
     supports_cost = True
+    supports_estimated_minute_usage = True
     supports_cookie_acquisition = True
     credential_fields = {
         "API_KEY": {
@@ -153,7 +154,8 @@ class DeepSeekProvider(Provider):
             cookie_names=None,
             empty_cookie_error="DEEPSEEK_COOKIE_EMPTY",
             use_edge=use_edge,
-            user_data_dir=user_data_dir,
+            user_data_dir=user_data_dir
+            or str(config_manager.CONFIG_DIR / "deepseek-chrome"),
         )
 
     @staticmethod

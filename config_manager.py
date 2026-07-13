@@ -7,6 +7,7 @@ import ctypes
 import json
 import logging
 import os
+import shutil
 import sys
 from ctypes import wintypes
 from datetime import datetime
@@ -15,7 +16,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from app_identity import APP_STORAGE_NAME
+from app_identity import APP_STORAGE_NAME, SINGLE_INSTANCE_MUTEX
 
 APP_NAME = APP_STORAGE_NAME
 
@@ -77,14 +78,176 @@ def app_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+DEFAULT_CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / APP_NAME
+LOCATION_PATH = DEFAULT_CONFIG_DIR / "location.json"
+_LOCATION_VERSION = 1
+
+
+def _normalize_data_dir(value: str | os.PathLike[str]) -> Path:
+    raw_value = os.path.expandvars(os.path.expanduser(str(value).strip()))
+    if not raw_value:
+        raise ValueError("应用数据目录不能为空")
+    if raw_value.startswith("\\\\"):
+        raise ValueError("应用数据目录不支持网络共享路径")
+    path = Path(raw_value)
+    if not path.is_absolute():
+        raise ValueError("应用数据目录必须使用绝对路径")
+    return path.resolve(strict=False)
+
+
+def _load_location_state() -> dict[str, Any]:
+    try:
+        values = json.loads(LOCATION_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    return values if isinstance(values, dict) else {}
+
+
+def _write_location_state(values: dict[str, Any]) -> None:
+    DEFAULT_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {"version": _LOCATION_VERSION, **values}
+    temp_path = LOCATION_PATH.with_suffix(".json.tmp")
+    temp_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    temp_path.replace(LOCATION_PATH)
+
+
+def _another_instance_running() -> bool:
+    if sys.platform != "win32":
+        return False
+    synchronize = 0x00100000
+    kernel32 = ctypes.windll.kernel32
+    kernel32.OpenMutexW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.OpenMutexW.restype = wintypes.HANDLE
+    handle = kernel32.OpenMutexW(synchronize, False, SINGLE_INSTANCE_MUTEX)
+    if not handle:
+        return False
+    kernel32.CloseHandle(handle)
+    return True
+
+
+def _validate_separate_dirs(source: Path, target: Path) -> None:
+    source = source.resolve(strict=False)
+    target = target.resolve(strict=False)
+    if source == target:
+        return
+    if source in target.parents or target in source.parents:
+        raise ValueError("新旧应用数据目录不能互相包含")
+
+
+def _data_entries(
+    path: Path, *, exclude_migration_backups: bool = False
+) -> list[Path]:
+    if not path.exists():
+        return []
+    location_path = LOCATION_PATH.resolve(strict=False)
+    return [
+        item
+        for item in path.iterdir()
+        if item.resolve(strict=False) != location_path
+        and (
+            not exclude_migration_backups
+            or not item.name.startswith("migration-backup-")
+        )
+    ]
+
+
+def validate_data_dir_target(value: str | os.PathLike[str]) -> Path:
+    target = _normalize_data_dir(value)
+    current = CONFIG_DIR.resolve(strict=False)
+    _validate_separate_dirs(current, target)
+    if target == current:
+        return target
+    target.mkdir(parents=True, exist_ok=True)
+    probe_path = target / ".tokenscope-write-test"
+    try:
+        probe_path.write_text("ok", encoding="utf-8")
+        probe_path.unlink()
+    except OSError as exc:
+        raise ValueError(f"应用数据目录不可写：{exc}") from exc
+    default_dir = DEFAULT_CONFIG_DIR.resolve(strict=False)
+    if target != default_dir and _data_entries(target):
+        raise ValueError("新的应用数据目录必须为空")
+    return target
+
+
+def _migrate_data_dir(source: Path, target: Path) -> None:
+    source = source.resolve(strict=False)
+    target = target.resolve(strict=False)
+    _validate_separate_dirs(source, target)
+    if source == target:
+        return
+    if not source.is_dir():
+        raise ValueError("原应用数据目录不存在")
+    target.mkdir(parents=True, exist_ok=True)
+    restoring_default = target == DEFAULT_CONFIG_DIR.resolve(strict=False)
+    target_entries = _data_entries(
+        target, exclude_migration_backups=restoring_default
+    )
+    if target_entries:
+        if not restoring_default:
+            raise ValueError("新的应用数据目录必须为空")
+        backup_dir = target / datetime.now().strftime("migration-backup-%Y%m%d-%H%M%S")
+        backup_dir.mkdir(parents=True, exist_ok=False)
+        for item in target_entries:
+            shutil.move(str(item), str(backup_dir / item.name))
+    for item in _data_entries(source, exclude_migration_backups=True):
+        destination = target / item.name
+        if item.is_dir():
+            shutil.copytree(item, destination)
+        else:
+            temp_path = destination.with_name(f".{destination.name}.migration.tmp")
+            shutil.copy2(item, temp_path)
+            temp_path.replace(destination)
+
+
+def _initialize_data_dir() -> tuple[Path, dict[str, Any]]:
+    DEFAULT_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    state = _load_location_state()
+    try:
+        active_dir = _normalize_data_dir(
+            state.get("data_dir") or str(DEFAULT_CONFIG_DIR)
+        )
+    except ValueError:
+        active_dir = DEFAULT_CONFIG_DIR.resolve(strict=False)
+        state = {"data_dir": str(active_dir), "migration_error": "目录指针无效"}
+
+    pending_value = state.get("pending_data_dir")
+    if pending_value and not _another_instance_running():
+        source_dir = active_dir
+        try:
+            pending_dir = _normalize_data_dir(pending_value)
+            _migrate_data_dir(source_dir, pending_dir)
+            next_state = {"data_dir": str(pending_dir)}
+            _write_location_state(next_state)
+        except (OSError, ValueError) as exc:
+            active_dir = source_dir
+            state = {"data_dir": str(source_dir), "migration_error": str(exc)}
+            try:
+                _write_location_state(state)
+            except OSError:
+                pass
+        else:
+            active_dir = pending_dir
+            state = next_state
+
+    try:
+        active_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        active_dir = DEFAULT_CONFIG_DIR.resolve(strict=False)
+        active_dir.mkdir(parents=True, exist_ok=True)
+        state = {"data_dir": str(active_dir), "migration_error": str(exc)}
+        _write_location_state(state)
+    return active_dir, state
+
+
 def config_dir() -> Path:
-    # 配置固定放在用户目录，避免安装目录权限变化，也避免凭证随程序目录被复制。
-    path = Path(os.environ.get("APPDATA", Path.home())) / APP_NAME
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+    # 启动阶段已经通过固定指针解析实际数据目录。
+    return CONFIG_DIR
 
 
-CONFIG_DIR = config_dir()
+CONFIG_DIR, _location_state = _initialize_data_dir()
 WIDGET_STATE_PATH = CONFIG_DIR / "widget-state.json"
 PANEL_LAYOUT_PATH = CONFIG_DIR / "panel-layout.json"
 CONFIG_PATH = CONFIG_DIR / "config.json"
@@ -96,6 +259,35 @@ UPDATER_LOG_PATH = CONFIG_DIR / "TokenScopeUpdater.log"
 LEGACY_CONFIG_PATH = app_dir() / "config.py"
 _config: dict[str, Any] = DEFAULT_CONFIG.copy()
 _logger_ready = False
+
+
+def pending_data_dir() -> Path | None:
+    value = _location_state.get("pending_data_dir")
+    if not value:
+        return None
+    try:
+        return _normalize_data_dir(value)
+    except ValueError:
+        return None
+
+
+def data_dir_migration_error() -> str:
+    return str(_location_state.get("migration_error") or "")
+
+
+def schedule_data_dir_change(value: str | os.PathLike[str]) -> bool:
+    global _location_state
+    target = validate_data_dir_target(value)
+    current = CONFIG_DIR.resolve(strict=False)
+    if target == current:
+        state = {"data_dir": str(current)}
+        changed = bool(_location_state.get("pending_data_dir"))
+    else:
+        state = {"data_dir": str(current), "pending_data_dir": str(target)}
+        changed = _location_state.get("pending_data_dir") != str(target)
+    _write_location_state(state)
+    _location_state = state
+    return changed
 
 
 def logger() -> logging.Logger:

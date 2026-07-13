@@ -11,6 +11,163 @@ import config_manager
 
 
 class ConfigTests(unittest.TestCase):
+    def test_data_directory_migration_copies_all_entries_and_keeps_source(self):
+        temp_root = Path.cwd() / ".test-appdata" / "tmp"
+        temp_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=temp_root) as directory:
+            root = Path(directory)
+            source = root / "source"
+            target = root / "target"
+            source.mkdir()
+            target.mkdir()
+            (source / "config.json").write_text("{}", encoding="utf-8")
+            (source / "usage.db").write_bytes(b"database")
+            profile = source / "mimo-chrome" / "Default"
+            profile.mkdir(parents=True)
+            (profile / "Cookies").write_bytes(b"cookies")
+
+            with patch.object(config_manager, "DEFAULT_CONFIG_DIR", root / "default"):
+                config_manager._migrate_data_dir(source, target)
+
+            self.assertEqual((target / "config.json").read_text(encoding="utf-8"), "{}")
+            self.assertEqual((target / "usage.db").read_bytes(), b"database")
+            self.assertEqual(
+                (target / "mimo-chrome" / "Default" / "Cookies").read_bytes(),
+                b"cookies",
+            )
+            self.assertTrue((source / "config.json").exists())
+            self.assertTrue((source / "usage.db").exists())
+            self.assertTrue((source / "mimo-chrome" / "Default" / "Cookies").exists())
+
+    def test_custom_data_directory_must_be_empty(self):
+        temp_root = Path.cwd() / ".test-appdata" / "tmp"
+        temp_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=temp_root) as directory:
+            root = Path(directory)
+            current = root / "current"
+            target = root / "target"
+            current.mkdir()
+            target.mkdir()
+            (target / "existing.txt").write_text("keep", encoding="utf-8")
+
+            with (
+                patch.object(config_manager, "CONFIG_DIR", current),
+                patch.object(config_manager, "DEFAULT_CONFIG_DIR", root / "default"),
+            ):
+                with self.assertRaisesRegex(ValueError, "必须为空"):
+                    config_manager.validate_data_dir_target(target)
+
+            self.assertEqual((target / "existing.txt").read_text(encoding="utf-8"), "keep")
+
+    def test_scheduling_data_directory_change_writes_bootstrap_pointer(self):
+        temp_root = Path.cwd() / ".test-appdata" / "tmp"
+        temp_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=temp_root) as directory:
+            root = Path(directory)
+            current = root / "current"
+            target = root / "target"
+            default = root / "default"
+            location_path = default / "location.json"
+            current.mkdir()
+            target.mkdir()
+            old_state = config_manager._location_state
+            try:
+                with (
+                    patch.object(config_manager, "CONFIG_DIR", current),
+                    patch.object(config_manager, "DEFAULT_CONFIG_DIR", default),
+                    patch.object(config_manager, "LOCATION_PATH", location_path),
+                ):
+                    config_manager._location_state = {"data_dir": str(current)}
+                    self.assertTrue(config_manager.schedule_data_dir_change(target))
+                    state = json.loads(location_path.read_text(encoding="utf-8"))
+
+                self.assertEqual(state["version"], 1)
+                self.assertEqual(Path(state["data_dir"]), current.resolve())
+                self.assertEqual(Path(state["pending_data_dir"]), target.resolve())
+            finally:
+                config_manager._location_state = old_state
+
+    def test_startup_applies_pending_data_directory_only_after_copy(self):
+        temp_root = Path.cwd() / ".test-appdata" / "tmp"
+        temp_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=temp_root) as directory:
+            root = Path(directory)
+            default = root / "default"
+            source = root / "source"
+            target = root / "target"
+            default.mkdir()
+            source.mkdir()
+            target.mkdir()
+            (source / "usage.db").write_bytes(b"history")
+            location_path = default / "location.json"
+            location_path.write_text(
+                json.dumps(
+                    {"data_dir": str(source), "pending_data_dir": str(target)}
+                ),
+                encoding="utf-8",
+            )
+
+            with (
+                patch.object(config_manager, "DEFAULT_CONFIG_DIR", default),
+                patch.object(config_manager, "LOCATION_PATH", location_path),
+                patch.object(config_manager, "_another_instance_running", return_value=False),
+            ):
+                active, state = config_manager._initialize_data_dir()
+
+            saved_state = json.loads(location_path.read_text(encoding="utf-8"))
+            self.assertEqual(active, target.resolve())
+            self.assertEqual(state, {"data_dir": str(target.resolve())})
+            self.assertNotIn("pending_data_dir", saved_state)
+            self.assertEqual((target / "usage.db").read_bytes(), b"history")
+            self.assertEqual((source / "usage.db").read_bytes(), b"history")
+
+    def test_startup_keeps_old_directory_when_migration_fails(self):
+        temp_root = Path.cwd() / ".test-appdata" / "tmp"
+        temp_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=temp_root) as directory:
+            root = Path(directory)
+            default = root / "default"
+            source = root / "source"
+            target = root / "target"
+            default.mkdir()
+            source.mkdir()
+            target.mkdir()
+            (source / "config.json").write_text("source", encoding="utf-8")
+            (target / "existing.txt").write_text("keep", encoding="utf-8")
+            location_path = default / "location.json"
+            location_path.write_text(
+                json.dumps(
+                    {"data_dir": str(source), "pending_data_dir": str(target)}
+                ),
+                encoding="utf-8",
+            )
+
+            with (
+                patch.object(config_manager, "DEFAULT_CONFIG_DIR", default),
+                patch.object(config_manager, "LOCATION_PATH", location_path),
+                patch.object(config_manager, "_another_instance_running", return_value=False),
+            ):
+                active, state = config_manager._initialize_data_dir()
+
+            self.assertEqual(active, source.resolve())
+            self.assertEqual(state["data_dir"], str(source.resolve()))
+            self.assertIn("必须为空", state["migration_error"])
+            self.assertEqual((source / "config.json").read_text(encoding="utf-8"), "source")
+            self.assertEqual((target / "existing.txt").read_text(encoding="utf-8"), "keep")
+
+    def test_data_directory_rejects_relative_unc_and_nested_paths(self):
+        with self.assertRaisesRegex(ValueError, "绝对路径"):
+            config_manager._normalize_data_dir("relative/path")
+        with self.assertRaisesRegex(ValueError, "网络共享"):
+            config_manager._normalize_data_dir(r"\\server\share")
+
+        temp_root = Path.cwd() / ".test-appdata" / "tmp"
+        current = temp_root / "current"
+        nested = current / "nested"
+        with patch.object(config_manager, "CONFIG_DIR", current.resolve()):
+            with self.assertRaisesRegex(ValueError, "不能互相包含"):
+                config_manager.validate_data_dir_target(nested)
+
     def test_boolean_and_provider_values_are_validated(self):
         self.assertFalse(
             config_manager.validate_config({"EDGE_HIDE_ENABLED": "false"})[
