@@ -102,6 +102,25 @@ def _connect() -> Iterator[sqlite3.Connection]:
                 );
                 CREATE INDEX IF NOT EXISTS idx_minute_snapshot_provider_date
                     ON minute_usage_snapshot(provider, usage_date);
+                CREATE TABLE IF NOT EXISTS minute_cost_usage (
+                    provider TEXT NOT NULL,
+                    usage_date TEXT NOT NULL,
+                    minute_index INTEGER NOT NULL,
+                    cost_cny TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (provider, usage_date, minute_index)
+                );
+                CREATE INDEX IF NOT EXISTS idx_minute_cost_usage_provider_date
+                    ON minute_cost_usage(provider, usage_date);
+                CREATE TABLE IF NOT EXISTS minute_cost_snapshot (
+                    provider TEXT NOT NULL,
+                    usage_date TEXT NOT NULL,
+                    cost_cny TEXT,
+                    observed_at TEXT NOT NULL,
+                    PRIMARY KEY (provider, usage_date)
+                );
+                CREATE INDEX IF NOT EXISTS idx_minute_cost_snapshot_provider_date
+                    ON minute_cost_snapshot(provider, usage_date);
                 """
             )
             yield connection
@@ -276,6 +295,127 @@ def _save_minute_snapshot(
         )
 
 
+def _cost_snapshot_row(
+    connection: sqlite3.Connection, provider: str, usage_date: str
+) -> tuple[Decimal | None, datetime | None, bool]:
+    row = connection.execute(
+        """SELECT cost_cny, observed_at FROM minute_cost_snapshot
+             WHERE provider = ? AND usage_date = ?""",
+        (provider, usage_date),
+    ).fetchone()
+    if row is None:
+        return None, None, False
+    raw_cost, raw_observed_at = row
+    try:
+        observed_at = datetime.fromisoformat(str(raw_observed_at))
+    except ValueError:
+        return None, None, False
+    if raw_cost is None:
+        return None, observed_at, True
+    try:
+        cost = Decimal(str(raw_cost))
+    except (InvalidOperation, ValueError):
+        return None, None, False
+    return (cost, observed_at, True) if cost.is_finite() else (None, None, False)
+
+
+def _save_minute_cost_snapshot(
+    connection: sqlite3.Connection,
+    provider: str,
+    usage_date: str,
+    cost_cny: Decimal | None,
+    observed_at: datetime,
+) -> None:
+    connection.execute(
+        """INSERT INTO minute_cost_snapshot
+               (provider, usage_date, cost_cny, observed_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(provider, usage_date) DO UPDATE SET
+               cost_cny = excluded.cost_cny,
+               observed_at = excluded.observed_at""",
+        (
+            provider,
+            usage_date,
+            str(cost_cny) if cost_cny is not None else None,
+            observed_at.isoformat(timespec="seconds"),
+        ),
+    )
+
+
+def _minute_indexes(previous_at: datetime, observed_at: datetime) -> list[int]:
+    start_minute = _minute_index(previous_at) + 1
+    end_minute = _minute_index(observed_at)
+    indexes = list(range(start_minute, end_minute + 1))
+    return indexes or [end_minute]
+
+
+def _add_minute_cost(
+    connection: sqlite3.Connection,
+    provider: str,
+    usage_date: str,
+    minute: int,
+    amount: Decimal,
+    updated_at: str,
+) -> None:
+    row = connection.execute(
+        """SELECT cost_cny FROM minute_cost_usage
+             WHERE provider = ? AND usage_date = ? AND minute_index = ?""",
+        (provider, usage_date, minute),
+    ).fetchone()
+    if row is None:
+        stored_amount = amount
+    elif amount == 0:
+        # 已有同一分钟的实际费用时，后续零增量不能覆盖它。
+        stored_amount = Decimal(str(row[0]))
+    else:
+        stored_amount = Decimal(str(row[0])) + amount
+    connection.execute(
+        """INSERT INTO minute_cost_usage
+               (provider, usage_date, minute_index, cost_cny, updated_at)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(provider, usage_date, minute_index) DO UPDATE SET
+               cost_cny = excluded.cost_cny,
+               updated_at = excluded.updated_at""",
+        (provider, usage_date, minute, str(stored_amount), updated_at),
+    )
+
+
+def _save_estimated_minute_cost_usage(
+    connection: sqlite3.Connection,
+    provider: str,
+    usage_date: str,
+    cost_cny: Decimal | None,
+    observed_at: datetime,
+) -> None:
+    previous, previous_at, has_snapshot = _cost_snapshot_row(
+        connection, provider, usage_date
+    )
+    _save_minute_cost_snapshot(connection, provider, usage_date, cost_cny, observed_at)
+    if (
+        cost_cny is None
+        or not has_snapshot
+        or previous is None
+        or previous_at is None
+        or previous_at == observed_at
+        or previous_at.date() != observed_at.date()
+        or previous_at > observed_at
+    ):
+        return
+    delta = cost_cny - previous
+    if delta < 0:
+        return
+    indexes = _minute_indexes(previous_at, observed_at)
+    share = delta / len(indexes)
+    allocated = Decimal("0")
+    updated_at = observed_at.isoformat(timespec="seconds")
+    for index, minute in enumerate(indexes):
+        amount = delta - allocated if index == len(indexes) - 1 else share
+        allocated += amount
+        _add_minute_cost(
+            connection, provider, usage_date, minute, amount, updated_at
+        )
+
+
 def _minute_usage_retention_threshold(current_day: date, retention_days: int) -> str:
     if retention_days < 1:
         raise ValueError("分时数据保存天数至少为 1 天")
@@ -296,6 +436,14 @@ def clear_expired_minute_usage(
             "DELETE FROM minute_usage_snapshot WHERE provider = ? AND usage_date < ?",
             (provider, threshold),
         )
+        connection.execute(
+            "DELETE FROM minute_cost_usage WHERE provider = ? AND usage_date < ?",
+            (provider, threshold),
+        )
+        connection.execute(
+            "DELETE FROM minute_cost_snapshot WHERE provider = ? AND usage_date < ?",
+            (provider, threshold),
+        )
 
 
 def save_estimated_minute_usage(
@@ -304,8 +452,9 @@ def save_estimated_minute_usage(
     totals: dict[str, int],
     observed_at: datetime,
     retention_days: int = 3,
+    cost_cny: Decimal | None = None,
 ) -> str:
-    """保存一次按刷新间隔均摊的 Token 差额。
+    """保存一次按刷新间隔均摊的 Token 与费用差额。
 
     返回值用于界面状态：``baseline``、``recorded``、``unchanged``、
     ``adjusted`` 或 ``cross_day``。首次采样只保存累计快照，不能把此前
@@ -316,6 +465,14 @@ def save_estimated_minute_usage(
         token_type: max(0, int(totals.get(token_type, 0) or 0))
         for token_type in MINUTE_TOKEN_TYPES
     }
+    if cost_cny is not None:
+        try:
+            cost_cny = Decimal(str(cost_cny))
+        except (InvalidOperation, ValueError):
+            cost_cny = None
+        else:
+            if not cost_cny.is_finite():
+                cost_cny = None
     with _connect() as connection:
         threshold = _minute_usage_retention_threshold(usage_day, retention_days)
         connection.execute(
@@ -326,50 +483,59 @@ def save_estimated_minute_usage(
             "DELETE FROM minute_usage_snapshot WHERE provider = ? AND usage_date < ?",
             (provider, threshold),
         )
+        connection.execute(
+            "DELETE FROM minute_cost_usage WHERE provider = ? AND usage_date < ?",
+            (provider, threshold),
+        )
+        connection.execute(
+            "DELETE FROM minute_cost_snapshot WHERE provider = ? AND usage_date < ?",
+            (provider, threshold),
+        )
         previous, previous_at = _snapshot_rows(connection, provider, usage_date)
         if previous_at is None:
             _save_minute_snapshot(connection, provider, usage_date, normalized, observed_at)
-            return "baseline"
-
-        deltas = {
-            token_type: normalized[token_type] - previous[token_type]
-            for token_type in MINUTE_TOKEN_TYPES
-        }
-        if previous_at == observed_at and not any(deltas.values()):
-            return "unchanged"
-        # 同一平台日以外的刷新间隔不能可靠地落到某一日的分钟上。
-        if previous_at.date() != observed_at.date() or previous_at > observed_at:
-            _save_minute_snapshot(connection, provider, usage_date, normalized, observed_at)
-            return "cross_day"
-        _save_minute_snapshot(connection, provider, usage_date, normalized, observed_at)
-        if any(amount < 0 for amount in deltas.values()):
-            # 平台修正累计值时只重置基线，不能回写负数破坏已有估算。
-            return "adjusted"
-        if not any(deltas.values()):
-            return "unchanged"
-
-        start_minute = _minute_index(previous_at) + 1
-        end_minute = _minute_index(observed_at)
-        minute_indexes = list(range(start_minute, end_minute + 1))
-        if not minute_indexes:
-            minute_indexes = [end_minute]
-        updated_at = observed_at.isoformat(timespec="seconds")
-        for token_type, delta in deltas.items():
-            quotient, remainder = divmod(delta, len(minute_indexes))
-            for index, minute in enumerate(minute_indexes):
-                amount = quotient + (1 if index < remainder else 0)
-                if not amount:
-                    continue
-                connection.execute(
-                    """INSERT INTO minute_usage
-                           (provider, usage_date, minute_index, token_type, token_amount, updated_at)
-                         VALUES (?, ?, ?, ?, ?, ?)
-                         ON CONFLICT(provider, usage_date, minute_index, token_type) DO UPDATE SET
-                           token_amount = minute_usage.token_amount + excluded.token_amount,
-                           updated_at = excluded.updated_at""",
-                    (provider, usage_date, minute, token_type, amount, updated_at),
-                )
-    return "recorded"
+            status = "baseline"
+        else:
+            deltas = {
+                token_type: normalized[token_type] - previous[token_type]
+                for token_type in MINUTE_TOKEN_TYPES
+            }
+            if previous_at == observed_at and not any(deltas.values()):
+                status = "unchanged"
+            # 同一平台日以外的刷新间隔不能可靠地落到某一日的分钟上。
+            elif previous_at.date() != observed_at.date() or previous_at > observed_at:
+                _save_minute_snapshot(connection, provider, usage_date, normalized, observed_at)
+                status = "cross_day"
+            else:
+                _save_minute_snapshot(connection, provider, usage_date, normalized, observed_at)
+                if any(amount < 0 for amount in deltas.values()):
+                    # 平台修正累计值时只重置基线，不能回写负数破坏已有估算。
+                    status = "adjusted"
+                elif not any(deltas.values()):
+                    status = "unchanged"
+                else:
+                    minute_indexes = _minute_indexes(previous_at, observed_at)
+                    updated_at = observed_at.isoformat(timespec="seconds")
+                    for token_type, delta in deltas.items():
+                        quotient, remainder = divmod(delta, len(minute_indexes))
+                        for index, minute in enumerate(minute_indexes):
+                            amount = quotient + (1 if index < remainder else 0)
+                            if not amount:
+                                continue
+                            connection.execute(
+                                """INSERT INTO minute_usage
+                                       (provider, usage_date, minute_index, token_type, token_amount, updated_at)
+                                     VALUES (?, ?, ?, ?, ?, ?)
+                                     ON CONFLICT(provider, usage_date, minute_index, token_type) DO UPDATE SET
+                                       token_amount = minute_usage.token_amount + excluded.token_amount,
+                                       updated_at = excluded.updated_at""",
+                                (provider, usage_date, minute, token_type, amount, updated_at),
+                            )
+                    status = "recorded"
+        _save_estimated_minute_cost_usage(
+            connection, provider, usage_date, cost_cny, observed_at
+        )
+    return status
 
 
 def minute_usage_for_day(provider: str, usage_day: date) -> list[dict[str, Any]]:
@@ -392,6 +558,28 @@ def minute_usage_for_day(provider: str, usage_day: date) -> list[dict[str, Any]]
     ]
 
 
+def minute_cost_usage_for_day(provider: str, usage_day: date) -> list[dict[str, Any]]:
+    """读取指定日期的分钟费用估算；缺失行表示该分钟尚无可靠费用。"""
+    with _connect() as connection:
+        rows = connection.execute(
+            """SELECT minute_index, cost_cny
+                 FROM minute_cost_usage
+                WHERE provider = ? AND usage_date = ?
+                ORDER BY minute_index""",
+            (provider, usage_day.isoformat()),
+        ).fetchall()
+    result: list[dict[str, Any]] = []
+    for minute_index, raw_cost in rows:
+        try:
+            cost = Decimal(str(raw_cost))
+        except (InvalidOperation, ValueError):
+            config_manager.logger().warning("Skipped malformed cached minute cost")
+            continue
+        if cost.is_finite():
+            result.append({"minute": int(minute_index), "cost_cny": cost})
+    return result
+
+
 def minute_usage_dates(provider: str) -> list[str]:
     """读取指定提供商仍保留分时缓存的日期，按日期升序返回。"""
     with _connect() as connection:
@@ -401,9 +589,13 @@ def minute_usage_dates(provider: str) -> list[str]:
                      SELECT usage_date FROM minute_usage WHERE provider = ?
                      UNION
                      SELECT usage_date FROM minute_usage_snapshot WHERE provider = ?
+                     UNION
+                     SELECT usage_date FROM minute_cost_usage WHERE provider = ?
+                     UNION
+                     SELECT usage_date FROM minute_cost_snapshot WHERE provider = ?
                  )
                  ORDER BY usage_date""",
-            (provider, provider),
+            (provider, provider, provider, provider),
         ).fetchall()
     return [str(usage_date) for (usage_date,) in rows]
 

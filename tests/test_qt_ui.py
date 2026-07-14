@@ -1,5 +1,6 @@
 import os
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
@@ -180,7 +181,7 @@ def test_minute_chart_tooltip_legend_and_navigator_preserve_raw_series():
         {"minute": minute, "token_type": "RESPONSE_TOKEN", "token_amount": 1}
         for minute in range(601, 625)
     )
-    chart.set_rows(rows, "recorded")
+    chart.set_rows(rows, "recorded", cost_rows=[{"minute": 600, "cost_cny": Decimal(".24")}])
     chart.show()
     APP.processEvents()
 
@@ -200,12 +201,14 @@ def test_minute_chart_tooltip_legend_and_navigator_preserve_raw_series():
     assert "输出　10" in tooltip
     assert "总计 110" in tooltip
     assert "缓存命中率　80.0%" in tooltip
+    assert "本分钟消耗金额　¥0.24" in tooltip
     assert chart._bars["RESPONSE_TOKEN"].opts["height"][600] == 10
     assert chart._bars["PROMPT_CACHE_MISS_TOKEN"].opts["y0"][600] == 10
     assert chart._bars["PROMPT_CACHE_HIT_TOKEN"].opts["y0"][600] == 30
     chart._show_hover(600, QPoint(120, 50))
     assert chart.hover_tooltip.isVisible()
     assert chart.hover_tooltip.time_label.text() == "10:00"
+    assert chart.hover_tooltip.cost_label.text() == "¥0.24"
     assert chart._hover_line.isVisible()
     assert chart._hover_bar.isVisible()
     chart.set_series_visible("RESPONSE_TOKEN", False)
@@ -351,6 +354,39 @@ def test_minute_chart_handles_zero_cache_denominator_and_panel_defaults_to_annua
     assert not panel.minute_previous_button.isEnabled()
     assert not panel.minute_next_button.isEnabled()
     panel.close()
+    chart.close()
+
+
+def test_minute_chart_cost_tooltip_handles_missing_zero_and_plot_boundaries():
+    chart = MinuteUsageChart()
+    chart.resize(900, 200)
+    chart.set_rows(
+        [{"minute": 600, "token_type": "RESPONSE_TOKEN", "token_amount": 1}],
+        "recorded",
+    )
+    assert "本分钟消耗金额　--" in chart.tooltip_text(600)
+    chart.set_rows(
+        [{"minute": 600, "token_type": "RESPONSE_TOKEN", "token_amount": 1}],
+        "recorded",
+        cost_rows=[{"minute": 600, "cost_cny": Decimal("0")}],
+    )
+    assert "本分钟消耗金额　¥0.00" in chart.tooltip_text(600)
+    chart.show()
+    APP.processEvents()
+
+    chart._show_hover(600, QPoint(0, 0))
+    tooltip = chart.hover_tooltip
+    view_left = chart.plot.mapFromScene(
+        chart.plot.getViewBox().sceneBoundingRect().topLeft()
+    ).x() + 6
+    assert tooltip.x() >= view_left
+    assert tooltip.x() + tooltip.width() <= chart.plot.width() - 6
+    assert 6 <= tooltip.y() <= chart.plot.height() - tooltip.height() - 6
+
+    chart._show_hover(600, QPoint(chart.plot.width() - 1, chart.plot.height() - 1))
+    assert tooltip.x() >= view_left
+    assert tooltip.x() + tooltip.width() <= chart.plot.width() - 6
+    assert 6 <= tooltip.y() <= chart.plot.height() - tooltip.height() - 6
     chart.close()
 
 

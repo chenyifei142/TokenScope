@@ -247,6 +247,123 @@ class HistoryTests(unittest.TestCase):
                 )
                 self.assertEqual(history.minute_usage_dates("deepseek"), ["2026-07-11"])
 
+    def test_estimated_minute_cost_usage_tracks_baselines_and_exact_distribution(self):
+        with tempfile.TemporaryDirectory(dir=self.temp_root()) as directory:
+            with patch.object(history, "DB_PATH", Path(directory) / "usage.db"):
+                usage_day = date(2026, 7, 13)
+                totals = {token_type: 0 for token_type in history.MINUTE_TOKEN_TYPES}
+                first = datetime(2026, 7, 13, 10, 0)
+                second = datetime(2026, 7, 13, 10, 3)
+                history.save_estimated_minute_usage(
+                    "mimo", usage_day, totals, first, cost_cny=Decimal("1.00")
+                )
+                totals["RESPONSE_TOKEN"] = 3
+                history.save_estimated_minute_usage(
+                    "mimo", usage_day, totals, second, cost_cny=Decimal("2.00")
+                )
+                rows = history.minute_cost_usage_for_day("mimo", usage_day)
+                self.assertEqual([row["minute"] for row in rows], [601, 602, 603])
+                self.assertEqual(sum(row["cost_cny"] for row in rows), Decimal("1.00"))
+                self.assertEqual(
+                    rows[-1]["cost_cny"],
+                    Decimal("1.00") - rows[0]["cost_cny"] - rows[1]["cost_cny"],
+                )
+
+                zero_totals = {token_type: 0 for token_type in history.MINUTE_TOKEN_TYPES}
+                history.save_estimated_minute_usage(
+                    "deepseek", usage_day, zero_totals, first, cost_cny=Decimal(".50")
+                )
+                history.save_estimated_minute_usage(
+                    "deepseek", usage_day, zero_totals, second, cost_cny=Decimal(".50")
+                )
+                self.assertEqual(
+                    [row["cost_cny"] for row in history.minute_cost_usage_for_day("deepseek", usage_day)],
+                    [Decimal("0"), Decimal("0"), Decimal("0")],
+                )
+
+                history.save_estimated_minute_usage(
+                    "missing", usage_day, zero_totals, first, cost_cny=Decimal(".50")
+                )
+                history.save_estimated_minute_usage(
+                    "missing", usage_day, zero_totals, second, cost_cny=None
+                )
+                history.save_estimated_minute_usage(
+                    "missing", usage_day, zero_totals, second + timedelta(minutes=1), cost_cny=Decimal("1.00")
+                )
+                self.assertEqual(history.minute_cost_usage_for_day("missing", usage_day), [])
+
+                history.save_estimated_minute_usage(
+                    "adjusted", usage_day, zero_totals, first, cost_cny=Decimal(".50")
+                )
+                history.save_estimated_minute_usage(
+                    "adjusted", usage_day, zero_totals, second, cost_cny=Decimal(".40")
+                )
+                self.assertEqual(history.minute_cost_usage_for_day("adjusted", usage_day), [])
+                history.save_estimated_minute_usage(
+                    "adjusted", usage_day + timedelta(days=1), zero_totals,
+                    first + timedelta(days=1), cost_cny=Decimal(".40"),
+                )
+                self.assertEqual(
+                    history.minute_cost_usage_for_day("adjusted", usage_day + timedelta(days=1)), []
+                )
+                self.assertEqual(
+                    history.minute_usage_dates("mimo"), [usage_day.isoformat()]
+                )
+
+                history.save_estimated_minute_usage(
+                    "cross-day", usage_day, zero_totals, first, cost_cny=Decimal(".50")
+                )
+                self.assertEqual(
+                    history.save_estimated_minute_usage(
+                        "cross-day", usage_day, zero_totals,
+                        first + timedelta(days=1), cost_cny=Decimal("1.00"),
+                    ),
+                    "cross_day",
+                )
+                self.assertEqual(history.minute_cost_usage_for_day("cross-day", usage_day), [])
+
+    def test_minute_cost_cleanup_and_transaction_are_provider_scoped(self):
+        with tempfile.TemporaryDirectory(dir=self.temp_root()) as directory:
+            with patch.object(history, "DB_PATH", Path(directory) / "usage.db"):
+                old_day = date(2026, 7, 12)
+                current_day = date(2026, 7, 13)
+                totals = {token_type: 0 for token_type in history.MINUTE_TOKEN_TYPES}
+                for provider, usage_day in (("mimo", old_day), ("deepseek", old_day)):
+                    history.save_estimated_minute_usage(
+                        provider, usage_day, totals, datetime.combine(usage_day, datetime.min.time()),
+                        cost_cny=Decimal("1"),
+                    )
+                    history.save_estimated_minute_usage(
+                        provider, usage_day, totals,
+                        datetime.combine(usage_day, datetime.min.time()) + timedelta(minutes=1),
+                        cost_cny=Decimal("2"),
+                    )
+                history.clear_expired_minute_usage("mimo", current_day, 1)
+                self.assertEqual(history.minute_cost_usage_for_day("mimo", old_day), [])
+                self.assertTrue(history.minute_cost_usage_for_day("deepseek", old_day))
+
+                history.save_estimated_minute_usage(
+                    "mimo", current_day, totals, datetime(2026, 7, 13, 10, 0), cost_cny=Decimal("1")
+                )
+                totals["RESPONSE_TOKEN"] = 4
+                connection = sqlite3.connect(history.DB_PATH)
+                try:
+                    connection.execute(
+                        """CREATE TRIGGER abort_minute_cost_write
+                             BEFORE INSERT ON minute_cost_usage
+                             WHEN NEW.provider = 'mimo'
+                             BEGIN SELECT RAISE(ABORT, 'test rollback'); END"""
+                    )
+                    connection.commit()
+                finally:
+                    connection.close()
+                with self.assertRaises(sqlite3.DatabaseError):
+                    history.save_estimated_minute_usage(
+                        "mimo", current_day, totals, datetime(2026, 7, 13, 10, 1), cost_cny=Decimal("2")
+                    )
+                self.assertEqual(history.minute_usage_for_day("mimo", current_day), [])
+                self.assertEqual(history.minute_cost_usage_for_day("mimo", current_day), [])
+
 
 if __name__ == "__main__":
     unittest.main()

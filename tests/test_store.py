@@ -11,6 +11,7 @@ os.environ["APPDATA"] = str(Path.cwd() / ".test-appdata")
 from api.providers.base import FetchError, ModelUsage, ProviderBalance, ProviderSummary
 from data.store import (
     TokenData,
+    cost_breakdown_for_day,
     months_for_activity,
     months_for_week,
     provider_usage_day,
@@ -191,6 +192,17 @@ class StoreTests(unittest.TestCase):
         })
         self.assertIsNone(token_breakdown_for_day([raw], date(2026, 7, 4)))
 
+    def test_today_cost_breakdown_distinguishes_missing_from_zero(self):
+        rows = [payload("2026-07-03", 7, ".24"), payload("2026-07-03", 2, ".06")]
+        self.assertEqual(cost_breakdown_for_day(rows, date(2026, 7, 3)), Decimal(".30"))
+        zero = [payload("2026-07-03", 7, "0")]
+        self.assertEqual(cost_breakdown_for_day(zero, date(2026, 7, 3)), Decimal("0"))
+        missing = payload("2026-07-03", 7)
+        missing["days"][0]["data"][0]["usage"] = [
+            {"type": "RESPONSE_TOKEN", "amount": 7}
+        ]
+        self.assertIsNone(cost_breakdown_for_day([missing], date(2026, 7, 3)))
+
     def test_provider_usage_day_uses_mimo_shanghai_and_deepseek_local_time(self):
         observed = datetime(2026, 7, 13, 16, 30, tzinfo=timezone.utc)
         self.assertEqual(provider_usage_day("mimo", observed), date(2026, 7, 14))
@@ -218,6 +230,23 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(data.minute_usage_status, "baseline")
         self.assertEqual(data.status, "partial")
         self.assertIn("LOCAL_STORAGE", {error.code for error in data.errors})
+
+    def test_minute_cost_aggregation_failure_keeps_token_sampling(self):
+        provider = FakeProvider(payloads=[payload("2026-07-03", 7, ".2")])
+        provider.supports_estimated_minute_usage = True
+        with (
+            patch("data.store.history.clear_expired_minute_usage"),
+            patch("data.store.history.minute_usage_for_day", return_value=[]),
+            patch("data.store.history.minute_cost_usage_for_day", return_value=[]),
+            patch("data.store.history.minute_usage_dates", return_value=[]),
+            patch("data.store.cost_breakdown_for_day", side_effect=ValueError("bad cost")),
+            patch("data.store.history.save_estimated_minute_usage", return_value="recorded") as save_minute,
+        ):
+            data = self.fetch_with(provider)
+
+        self.assertEqual(data.today_tokens, 7)
+        self.assertEqual(data.minute_usage_status, "recorded")
+        self.assertEqual(save_minute.call_args.kwargs["cost_cny"], None)
 
     def test_fetch_exposes_retained_minute_dates_and_history(self):
         provider = FakeProvider(payloads=[payload("2026-07-03", 7, ".2")])

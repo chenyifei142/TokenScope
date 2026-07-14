@@ -48,6 +48,13 @@ def test_theme_tokens_meet_readability_and_focus_contrast():
         assert len(tokens.heat) == 6
 
 
+def test_minute_tooltip_cost_uses_each_theme_accent():
+    for tokens in (LIGHT_THEME, DARK_THEME):
+        style = build_app_style(tokens)
+        cost_rule = style.split("QLabel#minuteTooltipCost", 1)[1].split("}", 1)[0]
+        assert f"color: {tokens.accent};" in cost_rule
+
+
 def test_activity_selected_mode_uses_the_specified_blue_and_white_text():
     style = build_app_style(LIGHT_THEME)
     checked_rule = style.split("QToolButton#activityModeButton:checked", 1)[1].split("}", 1)[0]

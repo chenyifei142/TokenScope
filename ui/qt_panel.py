@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 import pyqtgraph as pg
 from PySide6.QtCore import QDate, QLocale, QPoint, QSignalBlocker, QSize, Qt, Signal
@@ -694,9 +694,31 @@ class MinuteUsageTooltip(QFrame):
         footer.addStretch(1)
         footer.addWidget(self.rate_label)
         layout.addLayout(footer)
+
+        cost_divider = QFrame()
+        cost_divider.setObjectName("divider")
+        cost_divider.setFrameShape(QFrame.Shape.HLine)
+        cost_divider.setFixedHeight(1)
+        layout.addWidget(cost_divider)
+        cost_footer = QHBoxLayout()
+        cost_footer.setContentsMargins(0, 0, 0, 0)
+        cost_name = QLabel("本分钟消耗金额")
+        cost_name.setObjectName("minuteTooltipMuted")
+        self.cost_label = QLabel("--")
+        self.cost_label.setObjectName("minuteTooltipCost")
+        self.cost_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        cost_footer.addWidget(cost_name)
+        cost_footer.addStretch(1)
+        cost_footer.addWidget(self.cost_label)
+        layout.addLayout(cost_footer)
         self.hide()
 
-    def set_values(self, minute: int, values: tuple[int, int, int]) -> None:
+    def set_values(
+        self,
+        minute: int,
+        values: tuple[int, int, int],
+        cost_cny: Decimal | None,
+    ) -> None:
         hit, miss, output = values
         total = hit + miss + output
         rate = "--" if hit + miss == 0 else f"{hit / (hit + miss) * 100:.1f}%"
@@ -705,6 +727,7 @@ class MinuteUsageTooltip(QFrame):
         for label, value in zip(self.value_labels, values):
             label.setText(compact_tokens(value))
         self.rate_label.setText(rate)
+        self.cost_label.setText(format_money(cost_cny))
 
     def refresh_colors(self, colors: tuple[QColor, QColor, QColor]) -> None:
         for swatch, color in zip(self.swatches, colors):
@@ -729,6 +752,7 @@ class MinuteUsageChart(QWidget):
         super().__init__(parent)
         self.setObjectName("minuteUsageChart")
         self._values = {key: [0] * 1440 for key, _label in self.SERIES}
+        self._cost_values: list[Decimal | None] = [None] * 1440
         self._visible = {key: True for key, _label in self.SERIES}
         self._signature: tuple | None = None
         self._updating_region = False
@@ -814,7 +838,13 @@ class MinuteUsageChart(QWidget):
     def legend_color(self, token_type: str) -> QColor:
         return dict(zip((key for key, _label in self.SERIES), self._colors()))[token_type]
 
-    def set_rows(self, rows: list[dict], status: str, loading: bool = False) -> None:
+    def set_rows(
+        self,
+        rows: list[dict],
+        status: str,
+        loading: bool = False,
+        cost_rows: list[dict] | None = None,
+    ) -> None:
         values = {key: [0] * 1440 for key, _label in self.SERIES}
         for row in rows:
             try:
@@ -825,8 +855,18 @@ class MinuteUsageChart(QWidget):
             if not 0 <= minute < 1440 or token_type not in values:
                 continue
             values[token_type][minute] += max(0, int(row.get("token_amount", 0) or 0))
+        cost_values: list[Decimal | None] = [None] * 1440
+        for row in cost_rows or []:
+            try:
+                minute = int(row.get("minute", -1))
+                cost = Decimal(str(row.get("cost_cny")))
+            except (InvalidOperation, TypeError, ValueError):
+                continue
+            if 0 <= minute < 1440 and cost.is_finite():
+                cost_values[minute] = cost
         signature = (status, tuple(tuple(values[key]) for key, _label in self.SERIES))
         self._values = values
+        self._cost_values = cost_values
         if loading and not rows:
             self._show_state("正在刷新分时估算数据…")
             return
@@ -1109,13 +1149,18 @@ class MinuteUsageChart(QWidget):
         if self._hover_bar is not None:
             self._hover_bar.setOpts(x=[minute], height=[total], width=self._bar_width)
             self._hover_bar.show()
-        self.hover_tooltip.set_values(minute, values)
+        self.hover_tooltip.set_values(minute, values, self._cost_values[minute])
         self.hover_tooltip.adjustSize()
         x = local.x() + 10
         if x + self.hover_tooltip.width() > self.plot.width() - 6:
             x = local.x() - self.hover_tooltip.width() - 10
+        view_left = self.plot.mapFromScene(
+            self.plot.getViewBox().sceneBoundingRect().topLeft()
+        ).x() + 6
+        right_limit = self.plot.width() - self.hover_tooltip.width() - 6
+        x = max(view_left, min(x, max(view_left, right_limit)))
         y = max(6, min(local.y() + 8, self.plot.height() - self.hover_tooltip.height() - 6))
-        self.hover_tooltip.move(max(6, x), y)
+        self.hover_tooltip.move(x, y)
         self.hover_tooltip.raise_()
         self.hover_tooltip.show()
 
@@ -1137,7 +1182,8 @@ class MinuteUsageChart(QWidget):
             f"■ 输入（命中缓存）　{hit:,}\n"
             f"■ 输入（未命中缓存）　{miss:,}\n"
             f"■ 输出　{output:,}\n"
-            f"缓存命中率　{rate}"
+            f"缓存命中率　{rate}\n"
+            f"本分钟消耗金额　{format_money(self._cost_values[minute])}"
         )
 
     def summary_text(self) -> str:
@@ -1258,8 +1304,10 @@ class MainPanel(QFrame):
         self._minute_provider_id = ""
         self._minute_current_date = ""
         self._minute_current_rows: list[dict] = []
+        self._minute_current_cost_rows: list[dict] = []
         self._minute_current_status = "unavailable"
         self._minute_usage_history: dict[str, list[dict]] = {}
+        self._minute_cost_usage_history: dict[str, list[dict]] = {}
         self._minute_usage_days: list[str] = []
         self._minute_selected_date = ""
         self._minute_follows_latest = True
@@ -1602,8 +1650,10 @@ class MainPanel(QFrame):
 
         self._minute_current_date = data.minute_usage_date
         self._minute_current_rows = data.minute_usage
+        self._minute_current_cost_rows = data.minute_cost_usage
         self._minute_current_status = data.minute_usage_status
         self._minute_usage_history = dict(data.minute_usage_history)
+        self._minute_cost_usage_history = dict(data.minute_cost_usage_history)
         self._minute_usage_days = []
 
         current_date = QDate.fromString(data.minute_usage_date, "yyyy-MM-dd")
@@ -1650,6 +1700,7 @@ class MainPanel(QFrame):
         selected_date = self._minute_selected_date
         if selected_date == self._minute_current_date:
             rows = self._minute_current_rows
+            cost_rows = self._minute_current_cost_rows
             status = self._minute_current_status
             status_hint = {
                 "failed": "；刷新失败，当前显示最近结果",
@@ -1659,6 +1710,7 @@ class MainPanel(QFrame):
             tooltip = f"选择分时日期{status_hint}"
         else:
             rows = self._minute_usage_history.get(selected_date, [])
+            cost_rows = self._minute_cost_usage_history.get(selected_date, [])
             status = "recorded" if rows else "empty"
             tooltip = f"选择分时日期；当前查看 {selected_date}"
         self.minute_date_edit.date_button.setToolTip(tooltip)
@@ -1667,6 +1719,7 @@ class MainPanel(QFrame):
             rows,
             status,
             loading=loading and selected_date == self._minute_current_date,
+            cost_rows=cost_rows,
         )
         self.activity_summary.setText(
             self.minute_chart.summary_text()

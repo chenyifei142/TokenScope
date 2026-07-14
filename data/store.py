@@ -219,6 +219,35 @@ def token_breakdown_for_day(
     return totals if found_day else None
 
 
+def cost_breakdown_for_day(
+    payloads: list[dict[str, Any]], usage_day: date
+) -> Decimal | None:
+    """从已确认的按日接口响应中聚合当天累计费用。"""
+    total = Decimal("0")
+    found_cost = False
+    for payload in payloads:
+        for day in payload.get("days", []) or []:
+            if not isinstance(day, dict) or str(day.get("date", "")) != usage_day.isoformat():
+                continue
+            for item in day.get("data", []) or []:
+                if not isinstance(item, dict):
+                    continue
+                for usage in item.get("usage", []) or []:
+                    if not isinstance(usage, dict) or usage.get("type") != "cost_cny":
+                        continue
+                    try:
+                        amount = _decimal(usage.get("amount"))
+                    except ValueError:
+                        config_manager.logger().warning("Skipped malformed minute cost amount")
+                        continue
+                    if not amount.is_finite():
+                        config_manager.logger().warning("Skipped non-finite minute cost amount")
+                        continue
+                    total += amount
+                    found_cost = True
+    return total if found_cost else None
+
+
 def provider_observed_at(provider_id: str, observed_at: datetime) -> datetime:
     """将刷新时刻转换为提供商估算日界所使用的时区。"""
     if provider_id == "mimo":
@@ -282,6 +311,8 @@ class TokenData:
     minute_usage_date: str = ""
     minute_usage_days: list[str] = field(default_factory=list)
     minute_usage_history: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    minute_cost_usage: list[dict[str, Any]] = field(default_factory=list)
+    minute_cost_usage_history: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
     _last_snapshot: ClassVar["TokenData | None"] = None
     _provider_snapshots: ClassVar[dict[str, "TokenData"]] = {}
@@ -322,9 +353,11 @@ class TokenData:
         per.is_stale = False
         successes = 0
         minute_rows: list[dict[str, Any]] = []
+        minute_cost_rows: list[dict[str, Any]] = []
         minute_status = "unavailable"
         minute_days: list[str] = []
         minute_history: dict[str, list[dict[str, Any]]] = {}
+        minute_cost_history: dict[str, list[dict[str, Any]]] = {}
         if getattr(provider, "supports_estimated_minute_usage", False):
             try:
                 # 每次启动/刷新均按设置的保留天数清理；失败不能影响原有账单刷新。
@@ -333,9 +366,16 @@ class TokenData:
                     provider.id, current_day, retention_days
                 )
                 minute_rows = history.minute_usage_for_day(provider.id, current_day)
+                minute_cost_rows = history.minute_cost_usage_for_day(provider.id, current_day)
                 minute_days = history.minute_usage_dates(provider.id)
                 minute_history = {
                     usage_date: history.minute_usage_for_day(
+                        provider.id, date.fromisoformat(usage_date)
+                    )
+                    for usage_date in minute_days
+                }
+                minute_cost_history = {
+                    usage_date: history.minute_cost_usage_for_day(
                         provider.id, date.fromisoformat(usage_date)
                     )
                     for usage_date in minute_days
@@ -442,17 +482,34 @@ class TokenData:
                         minute_status = "empty"
                     else:
                         try:
+                            cost_total = cost_breakdown_for_day(payloads, current_day)
+                        except Exception:
+                            config_manager.logger().exception(
+                                "Minute cost aggregation failed for %s", provider.id
+                            )
+                            cost_total = None
+                        try:
                             minute_status = history.save_estimated_minute_usage(
                                 provider.id,
                                 current_day,
                                 token_totals,
                                 observed_at,
                                 retention_days,
+                                cost_cny=cost_total,
                             )
                             minute_rows = history.minute_usage_for_day(provider.id, current_day)
+                            minute_cost_rows = history.minute_cost_usage_for_day(
+                                provider.id, current_day
+                            )
                             minute_days = history.minute_usage_dates(provider.id)
                             minute_history = {
                                 usage_date: history.minute_usage_for_day(
+                                    provider.id, date.fromisoformat(usage_date)
+                                )
+                                for usage_date in minute_days
+                            }
+                            minute_cost_history = {
+                                usage_date: history.minute_cost_usage_for_day(
                                     provider.id, date.fromisoformat(usage_date)
                                 )
                                 for usage_date in minute_days
@@ -508,6 +565,8 @@ class TokenData:
         data.minute_usage_date = current_day.isoformat()
         data.minute_usage_days = minute_days
         data.minute_usage_history = minute_history
+        data.minute_cost_usage = minute_cost_rows
+        data.minute_cost_usage_history = minute_cost_history
 
         if successes:
             data.last_success_at = datetime.now()

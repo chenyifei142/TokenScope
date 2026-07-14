@@ -441,6 +441,13 @@ QLabel#minuteTooltipMuted {{
     border: 0;
     font-size: 11px;
 }}
+QLabel#minuteTooltipCost {{
+    color: {tokens.accent};
+    background: transparent;
+    border: 0;
+    font-size: 11px;
+    font-weight: 600;
+}}
 QPushButton#primaryButton {{
     color: white;
     background: {tokens.accent};
