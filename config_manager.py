@@ -56,6 +56,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "UPDATE_AUTO_CHECK_ENABLED": True,
     "UPDATE_CHANNEL": "stable",
     "UPDATE_SKIPPED_VERSION": "",
+    "MINUTE_USAGE_CHART_TYPE": "bar",
+    "MINUTE_USAGE_INTERVAL_MINUTES": 5,
     "MINUTE_USAGE_RETENTION_DAYS": 3,
 }
 FIELD_META: dict[str, dict[str, Any]] = {
@@ -70,6 +72,8 @@ FIELD_META: dict[str, dict[str, Any]] = {
     "PANEL_AUTO_COLLAPSE_ON_DEACTIVATE": {"kind": "bool"},
     "UI_THEME": {"kind": "choice", "choices": ("system", "light", "dark")},
     "UPDATE_AUTO_CHECK_ENABLED": {"kind": "bool"},
+    "MINUTE_USAGE_CHART_TYPE": {"kind": "choice", "choices": ("bar", "line")},
+    "MINUTE_USAGE_INTERVAL_MINUTES": {"kind": "int", "min": 1, "max": 60},
     "MINUTE_USAGE_RETENTION_DAYS": {"kind": "int", "min": 1, "max": 365},
 }
 

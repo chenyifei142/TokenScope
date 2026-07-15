@@ -170,6 +170,32 @@ class ConfigTests(unittest.TestCase):
 
     def test_boolean_and_provider_values_are_validated(self):
         self.assertEqual(
+            config_manager.validate_config({})["MINUTE_USAGE_CHART_TYPE"],
+            "bar",
+        )
+        self.assertEqual(
+            config_manager.validate_config({"MINUTE_USAGE_CHART_TYPE": "LINE"})[
+                "MINUTE_USAGE_CHART_TYPE"
+            ],
+            "line",
+        )
+        with self.assertRaises(ValueError):
+            config_manager.validate_config({"MINUTE_USAGE_CHART_TYPE": "area"})
+        self.assertEqual(
+            config_manager.validate_config({})["MINUTE_USAGE_INTERVAL_MINUTES"],
+            5,
+        )
+        self.assertEqual(
+            config_manager.validate_config({"MINUTE_USAGE_INTERVAL_MINUTES": 60})[
+                "MINUTE_USAGE_INTERVAL_MINUTES"
+            ],
+            60,
+        )
+        with self.assertRaisesRegex(ValueError, "不能小于"):
+            config_manager.validate_config({"MINUTE_USAGE_INTERVAL_MINUTES": 0})
+        with self.assertRaisesRegex(ValueError, "不能大于"):
+            config_manager.validate_config({"MINUTE_USAGE_INTERVAL_MINUTES": 61})
+        self.assertEqual(
             config_manager.validate_config({"MINUTE_USAGE_RETENTION_DAYS": 3})[
                 "MINUTE_USAGE_RETENTION_DAYS"
             ],

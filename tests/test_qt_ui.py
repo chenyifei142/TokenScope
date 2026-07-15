@@ -187,12 +187,12 @@ def test_minute_chart_tooltip_legend_and_navigator_preserve_raw_series():
 
     initial_left, initial_right = chart.plot.getViewBox().viewRange()[0]
     assert initial_right - initial_left == pytest.approx(24)
-    assert initial_left < 624 <= initial_right
+    assert chart._minute_at_x(initial_right - 0.01) == 624
     assert chart._nav_bars.zValue() > chart.region.zValue()
     assert chart._nav_handles.zValue() > chart._nav_bars.zValue()
     nav_left, nav_right = chart.navigator.getViewBox().viewRange()[0]
     assert nav_left == pytest.approx(-0.5)
-    assert nav_right == pytest.approx(1439.5)
+    assert nav_right == pytest.approx(24.5)
 
     tooltip = chart.tooltip_text(600)
     assert "10:00" in tooltip
@@ -202,9 +202,10 @@ def test_minute_chart_tooltip_legend_and_navigator_preserve_raw_series():
     assert "总计 110" in tooltip
     assert "缓存命中率　80.0%" in tooltip
     assert "本分钟消耗金额　¥0.24" in tooltip
-    assert chart._bars["RESPONSE_TOKEN"].opts["height"][600] == 10
-    assert chart._bars["PROMPT_CACHE_MISS_TOKEN"].opts["y0"][600] == 10
-    assert chart._bars["PROMPT_CACHE_HIT_TOKEN"].opts["y0"][600] == 30
+    assert chart._display_bucket_indexes[0] == 600
+    assert chart._bars["RESPONSE_TOKEN"].opts["height"][0] == 10
+    assert chart._bars["PROMPT_CACHE_MISS_TOKEN"].opts["y0"][0] == 10
+    assert chart._bars["PROMPT_CACHE_HIT_TOKEN"].opts["y0"][0] == 30
     chart._show_hover(600, QPoint(120, 50))
     assert chart.hover_tooltip.isVisible()
     assert chart.hover_tooltip.time_label.text() == "10:00"
@@ -213,14 +214,296 @@ def test_minute_chart_tooltip_legend_and_navigator_preserve_raw_series():
     assert chart._hover_bar.isVisible()
     chart.set_series_visible("RESPONSE_TOKEN", False)
     assert not chart._bars["RESPONSE_TOKEN"].isVisible()
-    assert chart._bars["PROMPT_CACHE_MISS_TOKEN"].opts["y0"][600] == 0
-    assert chart._bars["PROMPT_CACHE_HIT_TOKEN"].opts["y0"][600] == 20
+    assert chart._bars["PROMPT_CACHE_MISS_TOKEN"].opts["y0"][0] == 0
+    assert chart._bars["PROMPT_CACHE_HIT_TOKEN"].opts["y0"][0] == 20
     assert chart.tooltip_text(600) == tooltip
-    chart.region.setRegion((480.5, 504.5))
+    chart.region.setRegion((0.5, 12.5))
     APP.processEvents()
     left, right = chart.plot.getViewBox().viewRange()[0]
-    assert left == pytest.approx(480.5)
-    assert right == pytest.approx(504.5)
+    assert left == pytest.approx(0.5)
+    assert right == pytest.approx(12.5)
+    chart.close()
+
+
+def test_minute_chart_aggregates_configured_time_buckets_and_costs():
+    chart = MinuteUsageChart()
+    rows = [
+        {
+            "minute": 600,
+            "token_type": "PROMPT_CACHE_HIT_TOKEN",
+            "token_amount": 80,
+        },
+        {
+            "minute": 604,
+            "token_type": "PROMPT_CACHE_MISS_TOKEN",
+            "token_amount": 20,
+        },
+        {"minute": 604, "token_type": "RESPONSE_TOKEN", "token_amount": 10},
+        {"minute": 605, "token_type": "RESPONSE_TOKEN", "token_amount": 7},
+        {"minute": 1439, "token_type": "RESPONSE_TOKEN", "token_amount": 3},
+    ]
+    chart.set_rows(
+        rows,
+        "recorded",
+        cost_rows=[
+            {"minute": 600, "cost_cny": Decimal(".10")},
+            {"minute": 604, "cost_cny": Decimal(".14")},
+            {"minute": 605, "cost_cny": Decimal(".02")},
+            {"minute": 1439, "cost_cny": Decimal("0")},
+        ],
+        interval_minutes=5,
+    )
+
+    first_bucket = chart._bucket_index_for_minute(600)
+    next_bucket = chart._bucket_index_for_minute(605)
+    assert len(chart._bucket_starts) == 288
+    assert chart._bucket_centers[first_bucket] == 602
+    assert chart._values["PROMPT_CACHE_HIT_TOKEN"][first_bucket] == 80
+    assert chart._values["PROMPT_CACHE_MISS_TOKEN"][first_bucket] == 20
+    assert chart._values["RESPONSE_TOKEN"][first_bucket] == 10
+    assert chart._values["RESPONSE_TOKEN"][next_bucket] == 7
+    assert sum(sum(series) for series in chart._values.values()) == 120
+    assert "10:00–10:04　总计 110" in chart.tooltip_text(604)
+    assert "本时段消耗金额　¥0.24" in chart.tooltip_text(600)
+    assert "10:05–10:09　总计 7" in chart.tooltip_text(605)
+    assert "23:55–23:59" in chart.tooltip_text(1439)
+    assert "本时段消耗金额　¥0.00" in chart.tooltip_text(1439)
+    assert chart.summary_text().endswith("峰值 10:00–10:04")
+    first_display = chart._bucket_display_positions[first_bucket]
+    assert chart._bars["RESPONSE_TOKEN"].opts["height"][first_display] == 10
+
+    chart._show_hover(604, QPoint(120, 50))
+    assert chart.hover_tooltip.time_label.text() == "10:00–10:04"
+    assert chart.hover_tooltip.cost_name.text() == "本时段消耗金额"
+    assert chart.hover_tooltip.cost_label.text() == "¥0.24"
+    chart.close()
+
+
+def test_minute_chart_arbitrary_interval_aligns_to_midnight_and_clips_last_bucket():
+    chart = MinuteUsageChart()
+    chart.set_rows(
+        [
+            {"minute": 59, "token_type": "RESPONSE_TOKEN", "token_amount": 2},
+            {"minute": 60, "token_type": "RESPONSE_TOKEN", "token_amount": 3},
+            {"minute": 1439, "token_type": "RESPONSE_TOKEN", "token_amount": 4},
+        ],
+        "recorded",
+        interval_minutes=7,
+    )
+
+    assert len(chart._bucket_starts) == 206
+    assert "00:56–01:02　总计 5" in chart.tooltip_text(59)
+    assert "00:56–01:02　总计 5" in chart.tooltip_text(60)
+    assert "23:55–23:59　总计 4" in chart.tooltip_text(1439)
+    with pytest.raises(ValueError, match="1 到 60"):
+        chart.set_rows([], "empty", interval_minutes=61)
+    chart.close()
+
+
+def test_minute_chart_switches_between_bar_and_line_rendering():
+    chart = MinuteUsageChart()
+    rows = [
+        {
+            "minute": 600,
+            "token_type": "PROMPT_CACHE_HIT_TOKEN",
+            "token_amount": 80,
+        },
+        {"minute": 604, "token_type": "RESPONSE_TOKEN", "token_amount": 10},
+        {"minute": 605, "token_type": "RESPONSE_TOKEN", "token_amount": 7},
+    ]
+    chart.set_rows(rows, "recorded", interval_minutes=5, chart_type="line")
+
+    assert not chart._bars
+    assert set(chart._lines) == {key for key, _label in chart.SERIES}
+    assert chart._nav_bars is None
+    assert chart._nav_line is not None
+    hit_line = chart._lines["PROMPT_CACHE_HIT_TOKEN"]
+    assert chart._display_bucket_indexes == [120, 121]
+    assert list(hit_line.xData) == pytest.approx(
+        [index / 8 for index in range(9)]
+    )
+    assert list(hit_line.yData) == sorted(hit_line.yData, reverse=True)
+    hit_point_x, hit_point_y = chart._line_points[
+        "PROMPT_CACHE_HIT_TOKEN"
+    ].getData()
+    assert list(hit_point_x) == [0, 1]
+    assert list(hit_point_y) == [80, 0]
+    assert chart._line_points["PROMPT_CACHE_HIT_TOKEN"].opts["size"] == 4
+    assert chart._line_points["PROMPT_CACHE_HIT_TOKEN"].opts["antialias"] is True
+    assert hit_line.opts["antialias"] is True
+    assert hit_line.opts["pen"].capStyle() == Qt.PenCapStyle.RoundCap
+    assert hit_line.opts["pen"].joinStyle() == Qt.PenJoinStyle.RoundJoin
+    assert (
+        chart._line_points["PROMPT_CACHE_HIT_TOKEN"].opts["pen"].color()
+        == hit_line.opts["pen"].color()
+    )
+    assert chart._nav_line.opts["antialias"] is True
+    assert chart._nav_line.opts["pen"].capStyle() == Qt.PenCapStyle.RoundCap
+    response_point_x, response_point_y = chart._line_points[
+        "RESPONSE_TOKEN"
+    ].getData()
+    assert list(response_point_x) == [0, 1]
+    assert list(response_point_y) == [10, 7]
+    chart.set_series_visible("RESPONSE_TOKEN", False)
+    assert not chart._lines["RESPONSE_TOKEN"].isVisible()
+    assert not chart._line_points["RESPONSE_TOKEN"].isVisible()
+
+    chart._show_hover(600, QPoint(120, 50))
+    assert chart._hover_line.isVisible()
+    assert chart._hover_line.value() == 0
+    assert chart._hover_bar is None
+    assert chart.hover_tooltip.time_label.text() == "10:00–10:04"
+
+    chart.set_rows(rows, "recorded", interval_minutes=5, chart_type="bar")
+    assert chart._bars
+    assert not chart._lines
+    assert not chart._line_points
+    assert chart._nav_bars is not None
+    assert chart._nav_line is None
+    with pytest.raises(ValueError, match="bar 或 line"):
+        chart.set_rows([], "empty", chart_type="area")
+    chart.close()
+
+
+def test_minute_line_chart_compacts_distant_active_buckets_and_preserves_labels():
+    chart = MinuteUsageChart()
+    chart.set_rows(
+        [
+            {"minute": 60, "token_type": "RESPONSE_TOKEN", "token_amount": 2},
+            {"minute": 600, "token_type": "RESPONSE_TOKEN", "token_amount": 3},
+        ],
+        "recorded",
+        chart_type="line",
+    )
+
+    assert chart._display_bucket_indexes == [60, 600]
+    assert list(chart._nav_line.xData) == pytest.approx(
+        [index / 8 for index in range(9)]
+    )
+    assert chart.plot.getViewBox().viewRange()[0] == pytest.approx([-0.5, 1.5])
+    assert chart.navigator.getViewBox().viewRange()[0] == pytest.approx([-0.5, 1.5])
+    assert chart.plot.getAxis("bottom")._tickLevels == [
+        [(0.0, "01:00"), (1.0, "10:00")]
+    ]
+    assert chart.navigator.getAxis("bottom")._tickLevels == [
+        [(0.0, "01:00"), (1.0, "10:00")]
+    ]
+    assert chart._minute_at_x(0) == 60
+    assert chart._minute_at_x(1) == 600
+
+    chart.show()
+    APP.processEvents()
+    chart._on_mouse_moved(
+        (chart.plot.getViewBox().mapViewToScene(QPointF(1, 2)),)
+    )
+    assert chart._hover_line.value() == 1
+    assert chart.hover_tooltip.isVisible()
+    assert chart.hover_tooltip.time_label.text() == "10:00"
+    chart.close()
+
+
+def test_minute_line_chart_shows_latest_24_active_buckets_and_navigates_all():
+    chart = MinuteUsageChart()
+    chart.set_rows(
+        [
+            {
+                "minute": index * 10,
+                "token_type": "RESPONSE_TOKEN",
+                "token_amount": index + 1,
+            }
+            for index in range(30)
+        ],
+        "recorded",
+        chart_type="line",
+    )
+
+    assert chart._display_bucket_indexes == [index * 10 for index in range(30)]
+    assert chart.plot.getViewBox().viewRange()[0] == pytest.approx([5.5, 29.5])
+    assert chart.navigator.getViewBox().viewRange()[0] == pytest.approx([-0.5, 29.5])
+    chart.region.setRegion((0.5, 12.5))
+    APP.processEvents()
+    assert chart.plot.getViewBox().viewRange()[0] == pytest.approx([0.5, 12.5])
+    assert chart._minute_at_x(1) == 10
+    assert chart._minute_at_x(12) == 120
+    chart.close()
+
+
+def test_minute_line_chart_smoothing_is_bounded_and_preserves_original_nodes():
+    x_values = [0.0, 1.0, 2.0, 3.0]
+    y_values = [0, 10, 3, 20]
+    smooth_x, smooth_y = MinuteUsageChart._smooth_curve_data(x_values, y_values)
+
+    assert len(smooth_x) == len(smooth_y) == 25
+    for index, expected in enumerate(y_values):
+        sample_index = index * 8
+        assert smooth_x[sample_index] == index
+        assert smooth_y[sample_index] == expected
+    for segment, (start, end) in enumerate(zip(y_values, y_values[1:])):
+        segment_values = smooth_y[segment * 8 : (segment + 1) * 8 + 1]
+        assert min(start, end) <= min(segment_values)
+        assert max(segment_values) <= max(start, end)
+        assert min(segment_values) >= 0
+
+    assert MinuteUsageChart._smooth_curve_data([0.0], [7]) == ([0.0], [7.0])
+    two_x, two_y = MinuteUsageChart._smooth_curve_data([0.0, 1.0], [2, 10])
+    assert two_x == pytest.approx([index / 8 for index in range(9)])
+    assert two_y == pytest.approx([2 + index for index in range(9)])
+
+
+@pytest.mark.parametrize(
+    ("interval_minutes", "minute", "expected_label"),
+    [
+        (1, 1439, "23:59"),
+        (5, 1439, "23:55"),
+        (7, 1439, "23:55"),
+        (60, 1439, "23:00"),
+    ],
+)
+@pytest.mark.parametrize("chart_type", ["bar", "line"])
+def test_minute_chart_compact_axis_labels_use_real_bucket_times(
+    interval_minutes, minute, expected_label, chart_type
+):
+    chart = MinuteUsageChart()
+    chart.set_rows(
+        [
+            {"minute": 60, "token_type": "RESPONSE_TOKEN", "token_amount": 2},
+            {"minute": minute, "token_type": "RESPONSE_TOKEN", "token_amount": 3},
+        ],
+        "recorded",
+        interval_minutes=interval_minutes,
+        chart_type=chart_type,
+    )
+
+    last_position = len(chart._display_bucket_indexes) - 1
+    assert chart.plot.getAxis("bottom")._tickLevels[0][-1] == (
+        float(last_position),
+        expected_label,
+    )
+    assert expected_label in chart.tooltip_text(minute)
+    chart.close()
+
+
+def test_minute_chart_default_range_shows_about_24_configured_buckets():
+    chart = MinuteUsageChart()
+    chart.resize(900, 180)
+    chart.set_rows(
+        [
+            {
+                "minute": 600 + index * 5,
+                "token_type": "RESPONSE_TOKEN",
+                "token_amount": 1,
+            }
+            for index in range(25)
+        ],
+        "recorded",
+        interval_minutes=5,
+    )
+    APP.processEvents()
+
+    assert not chart._sparse_mode
+    left, right = chart.plot.getViewBox().viewRange()[0]
+    assert right - left == pytest.approx(24)
+    assert chart._bar_width <= 0.84
     chart.close()
 
 
@@ -242,12 +525,12 @@ def test_minute_chart_uses_compact_range_for_up_to_24_nonzero_minutes():
         APP.processEvents()
         left, right = chart.plot.getViewBox().viewRange()[0]
         assert chart._sparse_mode
-        assert left <= 600
-        assert right >= 600 + count - 1
-        assert right - left <= max(1.5, count)
+        assert left == pytest.approx(-0.5)
+        assert right == pytest.approx(max(0.5, count - 0.5))
+        assert right - left == pytest.approx(max(1, count))
         nav_left, nav_right = chart.navigator.getViewBox().viewRange()[0]
         assert nav_left == pytest.approx(-0.5)
-        assert nav_right == pytest.approx(1439.5)
+        assert nav_right == pytest.approx(max(0.5, count - 0.5))
         assert chart._minute_at_x(left + 0.01) == 600
         assert chart._minute_at_x(right - 0.01) == 600 + count - 1
         pixel_width = chart._bar_width * chart.plot.getViewBox().width() / (right - left)
@@ -266,17 +549,17 @@ def test_minute_chart_hides_tooltip_when_pointer_leaves_bar():
     APP.processEvents()
 
     chart._on_mouse_moved(
-        (chart.plot.getViewBox().mapViewToScene(QPointF(600, 50)),)
+        (chart.plot.getViewBox().mapViewToScene(QPointF(0, 50)),)
     )
     assert chart.hover_tooltip.isVisible()
     chart._on_mouse_moved(
-        (chart.plot.getViewBox().mapViewToScene(QPointF(600, 101)),)
+        (chart.plot.getViewBox().mapViewToScene(QPointF(0, 101)),)
     )
     assert not chart.hover_tooltip.isVisible()
     chart.close()
 
 
-def test_minute_chart_keeps_existing_navigation_for_more_than_24_minutes():
+def test_minute_chart_shows_latest_24_active_buckets_and_navigates_all():
     for count in (25, 100):
         chart = MinuteUsageChart()
         rows = [
@@ -293,16 +576,16 @@ def test_minute_chart_keeps_existing_navigation_for_more_than_24_minutes():
         assert not chart._sparse_mode
         left, right = chart.plot.getViewBox().viewRange()[0]
         assert right - left == pytest.approx(24)
-        assert left < 720 + count - 1 <= right
-        chart.region.setRegion((480.5, 504.5))
+        assert chart._minute_at_x(right - 0.01) == 720 + count - 1
+        chart.region.setRegion((0.5, 12.5))
         APP.processEvents()
         left, right = chart.plot.getViewBox().viewRange()[0]
-        assert left == pytest.approx(480.5)
-        assert right == pytest.approx(504.5)
+        assert left == pytest.approx(0.5)
+        assert right == pytest.approx(12.5)
         chart.close()
 
 
-def test_minute_chart_sparse_distant_points_keep_real_timeline_and_focus_latest():
+def test_minute_chart_sparse_distant_points_use_compact_timeline():
     chart = MinuteUsageChart()
     rows = [
         {"minute": 60, "token_type": "RESPONSE_TOKEN", "token_amount": 10},
@@ -312,10 +595,21 @@ def test_minute_chart_sparse_distant_points_keep_real_timeline_and_focus_latest(
 
     left, right = chart.plot.getViewBox().viewRange()[0]
     assert chart._sparse_mode
-    assert right - left == pytest.approx(24)
-    assert left < 600 <= right
-    assert not left <= 60 <= right
-    assert chart._nav_bars.opts["x"] == [60, 600]
+    assert (left, right) == pytest.approx((-0.5, 1.5))
+    assert chart._display_bucket_indexes == [60, 600]
+    assert chart._nav_bars.opts["x"] == [0, 1]
+    assert chart._minute_at_x(0) == 60
+    assert chart._minute_at_x(1) == 600
+    assert chart.plot.getAxis("bottom")._tickLevels == [
+        [(0.0, "01:00"), (1.0, "10:00")]
+    ]
+    chart.show()
+    APP.processEvents()
+    chart._on_mouse_moved(
+        (chart.plot.getViewBox().mapViewToScene(QPointF(1, 10)),)
+    )
+    assert chart.hover_tooltip.isVisible()
+    assert chart.hover_tooltip.time_label.text() == "10:00"
     chart.close()
 
 
@@ -337,7 +631,7 @@ def test_minute_chart_handles_zero_cache_denominator_and_panel_defaults_to_annua
     )
     assert "缓存命中率　--" in chart.tooltip_text(1)
     assert "总计 0" in chart.tooltip_text(2)
-    assert chart._minute_at_x(2.0) == 2
+    assert chart._minute_at_x(2.0) == 1
     hit, miss, output = chart._colors()
     assert hit.lightness() > miss.lightness() > output.lightness()
     panel = MainPanel()
@@ -482,7 +776,8 @@ def test_minute_date_selection_renders_history_and_refresh_keeps_user_choice():
         panel.update_data(data)
         panel.minute_previous_button.click()
         assert panel.minute_date_edit.date() == QDate(2026, 7, 13)
-        assert panel.minute_chart._values["RESPONSE_TOKEN"][10] == 10
+        bucket_index = panel.minute_chart._bucket_index_for_minute(10)
+        assert panel.minute_chart._values["RESPONSE_TOKEN"][bucket_index] == 10
 
         panel.update_data(data)
         assert panel.minute_date_edit.date() == QDate(2026, 7, 13)
@@ -1020,6 +1315,7 @@ def test_settings_exposes_panel_auto_collapse_toggle():
 def test_settings_exposes_minute_usage_retention_days():
     values = {
         **config_manager.all_config(),
+        "MINUTE_USAGE_CHART_TYPE": "line",
         "MINUTE_USAGE_RETENTION_DAYS": 7,
     }
     with (
@@ -1028,6 +1324,14 @@ def test_settings_exposes_minute_usage_retention_days():
     ):
         window = SettingsWindow()
 
+    assert window.minute_usage_interval_minutes.value() == 5
+    window.minute_usage_interval_minutes.setValue(15)
+    assert window._values()["MINUTE_USAGE_INTERVAL_MINUTES"] == 15
+    assert window.minute_usage_chart_type.currentData() == "line"
+    window.minute_usage_chart_type.setCurrentIndex(
+        window.minute_usage_chart_type.findData("bar")
+    )
+    assert window._values()["MINUTE_USAGE_CHART_TYPE"] == "bar"
     assert window.minute_usage_retention_days.value() == 7
     window.minute_usage_retention_days.setValue(14)
     assert window._values()["MINUTE_USAGE_RETENTION_DAYS"] == 14

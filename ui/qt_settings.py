@@ -187,6 +187,18 @@ class SettingsWindow(QDialog):
         self.refresh_seconds.setRange(5, 3600)
         self.refresh_seconds.setSuffix(" 秒")
         runtime_form.addRow("刷新间隔", self.refresh_seconds)
+        self.minute_usage_interval_minutes = QSpinBox()
+        self.minute_usage_interval_minutes.setRange(1, 60)
+        self.minute_usage_interval_minutes.setSuffix(" 分钟")
+        self.minute_usage_interval_minutes.setToolTip(
+            "仅合并分时图的展示粒度，底层分钟数据和刷新频率保持不变"
+        )
+        runtime_form.addRow("分时统计间隔", self.minute_usage_interval_minutes)
+        self.minute_usage_chart_type = QComboBox()
+        self.minute_usage_chart_type.addItem("柱状图", "bar")
+        self.minute_usage_chart_type.addItem("折线图", "line")
+        self.minute_usage_chart_type.setToolTip("切换今日分时主图和全天导航的展示样式")
+        runtime_form.addRow("分时图表样式", self.minute_usage_chart_type)
         self.minute_usage_retention_days = QSpinBox()
         self.minute_usage_retention_days.setRange(1, 365)
         self.minute_usage_retention_days.setSuffix(" 天")
@@ -627,6 +639,13 @@ class SettingsWindow(QDialog):
     def _load_values(self) -> None:
         values = config_manager.load_config()
         self.refresh_seconds.setValue(max(5, int(values.get("REFRESH_INTERVAL", 60_000)) // 1000))
+        self.minute_usage_interval_minutes.setValue(
+            int(values.get("MINUTE_USAGE_INTERVAL_MINUTES", 5))
+        )
+        chart_type = str(values.get("MINUTE_USAGE_CHART_TYPE", "bar"))
+        self.minute_usage_chart_type.setCurrentIndex(
+            max(0, self.minute_usage_chart_type.findData(chart_type))
+        )
         self.minute_usage_retention_days.setValue(
             int(values.get("MINUTE_USAGE_RETENTION_DAYS", 3))
         )
@@ -670,6 +689,10 @@ class SettingsWindow(QDialog):
         self._remember_visible_credentials()
         values: dict[str, Any] = {
             "REFRESH_INTERVAL": self.refresh_seconds.value() * 1000,
+            "MINUTE_USAGE_CHART_TYPE": str(
+                self.minute_usage_chart_type.currentData() or "bar"
+            ),
+            "MINUTE_USAGE_INTERVAL_MINUTES": self.minute_usage_interval_minutes.value(),
             "MINUTE_USAGE_RETENTION_DAYS": self.minute_usage_retention_days.value(),
             "ACTIVE_PROVIDER": str(self.provider_combo.currentData() or ""),
             "UI_THEME": str(self.theme_combo.currentData() or "dark"),

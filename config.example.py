@@ -19,6 +19,10 @@ ACTIVE_PROVIDER = "deepseek"
 
 # Refresh interval in milliseconds
 REFRESH_INTERVAL = 60_000  # 60 seconds
+# Today intraday chart display interval in minutes; raw cache remains minute-level
+MINUTE_USAGE_INTERVAL_MINUTES = 5
+# Today intraday chart type: "bar" or "line"
+MINUTE_USAGE_CHART_TYPE = "bar"
 EDGE_HIDE_ENABLED = True
 
 # Widget appearance
