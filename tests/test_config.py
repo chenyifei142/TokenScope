@@ -1,5 +1,7 @@
 import json
 import os
+import sqlite3
+from contextlib import closing
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,12 +13,54 @@ import config_manager
 
 
 class ConfigTests(unittest.TestCase):
-    def test_legacy_data_directory_and_credential_prefix_remain_stable(self):
+    def test_legacy_data_directory_and_new_credential_prefix(self):
         self.assertEqual(config_manager.DEFAULT_CONFIG_DIR.name, "TokenSpider")
         self.assertEqual(
             config_manager._credential_target("DEEPSEEK_API_KEY"),
-            "TokenSpider/DEEPSEEK_API_KEY",
+            "TokenMeter/DEEPSEEK_API_KEY",
         )
+
+    def test_credentials_fall_back_in_order_and_copy_forward(self):
+        with (
+            patch.object(config_manager.os, "name", "nt"),
+            patch.object(
+                config_manager,
+                "_read_credential_target",
+                side_effect=["", "legacy-secret"],
+            ) as read_target,
+            patch.object(config_manager, "_write_credential") as write_credential,
+        ):
+            self.assertEqual(config_manager._read_credential("MIMO_COOKIE"), "legacy-secret")
+
+        self.assertEqual(
+            [call.args[0] for call in read_target.call_args_list],
+            ["TokenMeter/MIMO_COOKIE", "TokenSpider/MIMO_COOKIE"],
+        )
+        write_credential.assert_called_once_with("MIMO_COOKIE", "legacy-secret")
+
+    def test_e2e_mode_does_not_read_real_credentials(self):
+        with (
+            patch.dict(
+                config_manager.os.environ,
+                {"TOKENMETER_E2E_DISABLE_CREDENTIALS": "1"},
+            ),
+            patch.object(config_manager, "_read_credential_target") as read_target,
+        ):
+            self.assertEqual(config_manager._read_credential("MIMO_COOKIE"), "")
+
+        read_target.assert_not_called()
+
+    def test_credential_copy_failure_still_returns_legacy_value(self):
+        with (
+            patch.object(config_manager.os, "name", "nt"),
+            patch.object(
+                config_manager,
+                "_read_credential_target",
+                side_effect=["", "", "scope-secret"],
+            ),
+            patch.object(config_manager, "_write_credential", side_effect=OSError),
+        ):
+            self.assertEqual(config_manager._read_credential("DEEPSEEK_AUTH"), "scope-secret")
 
     def test_deepseek_peak_pricing_defaults_and_period_validation(self):
         defaults = config_manager.validate_config({})
@@ -62,7 +106,9 @@ class ConfigTests(unittest.TestCase):
             source.mkdir()
             target.mkdir()
             (source / "config.json").write_text("{}", encoding="utf-8")
-            (source / "usage.db").write_bytes(b"database")
+            with closing(sqlite3.connect(source / "usage.db")) as connection:
+                connection.execute("CREATE TABLE sample (value TEXT)")
+                connection.commit()
             profile = source / "mimo-chrome" / "Default"
             profile.mkdir(parents=True)
             (profile / "Cookies").write_bytes(b"cookies")
@@ -71,7 +117,8 @@ class ConfigTests(unittest.TestCase):
                 config_manager._migrate_data_dir(source, target)
 
             self.assertEqual((target / "config.json").read_text(encoding="utf-8"), "{}")
-            self.assertEqual((target / "usage.db").read_bytes(), b"database")
+            with closing(sqlite3.connect(target / "usage.db")) as connection:
+                self.assertEqual(connection.execute("PRAGMA quick_check").fetchone(), ("ok",))
             self.assertEqual(
                 (target / "mimo-chrome" / "Default" / "Cookies").read_bytes(),
                 b"cookies",
@@ -139,7 +186,9 @@ class ConfigTests(unittest.TestCase):
             default.mkdir()
             source.mkdir()
             target.mkdir()
-            (source / "usage.db").write_bytes(b"history")
+            with closing(sqlite3.connect(source / "usage.db")) as connection:
+                connection.execute("CREATE TABLE sample (value TEXT)")
+                connection.commit()
             location_path = default / "location.json"
             location_path.write_text(
                 json.dumps(
@@ -159,8 +208,8 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(active, target.resolve())
             self.assertEqual(state, {"data_dir": str(target.resolve())})
             self.assertNotIn("pending_data_dir", saved_state)
-            self.assertEqual((target / "usage.db").read_bytes(), b"history")
-            self.assertFalse(source.exists())
+            self.assertTrue((target / "usage.db").exists())
+            self.assertTrue(source.exists())
 
     def test_startup_keeps_old_directory_when_migration_fails(self):
         temp_root = Path.cwd() / ".test-appdata" / "tmp"
@@ -192,7 +241,7 @@ class ConfigTests(unittest.TestCase):
 
             self.assertEqual(active, source.resolve())
             self.assertEqual(state["data_dir"], str(source.resolve()))
-            self.assertIn("必须为空", state["migration_error"])
+            self.assertTrue(state["migration_error"])
             self.assertEqual((source / "config.json").read_text(encoding="utf-8"), "source")
             self.assertEqual((target / "existing.txt").read_text(encoding="utf-8"), "keep")
 

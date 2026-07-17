@@ -32,7 +32,7 @@ from app_update import (
     format_bytes,
     format_speed,
     is_packaged_windows_executable,
-    launch_updater,
+    launch_installer,
     mark_skipped_version,
     release_display_time,
     skipped_version,
@@ -111,7 +111,7 @@ class UpdatePromptDialog(QDialog):
         form.setHorizontalSpacing(18)
         form.setVerticalSpacing(8)
         form.addRow("发布时间", QLabel(release_display_time(release.published_at)))
-        form.addRow("文件大小", QLabel(format_bytes(release.app_asset.size)))
+        form.addRow("文件大小", QLabel(format_bytes(release.setup_asset.size)))
         form.addRow("更新通道", QLabel("预发布版" if release.is_prerelease else "正式版"))
         root.addLayout(form)
 
@@ -360,7 +360,7 @@ class AppUpdateController(QObject):
 
         assert bundle is not None
         try:
-            launch_updater(bundle)
+            launch_installer(bundle)
         except Exception as exc:
             QMessageBox.warning(parent, "软件更新", str(exc))
             self.status_changed.emit(self.status_text())

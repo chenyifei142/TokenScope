@@ -7,7 +7,6 @@ import ctypes
 import json
 import logging
 import os
-import shutil
 import sys
 from ctypes import wintypes
 from datetime import datetime
@@ -17,6 +16,13 @@ from typing import Any
 from urllib.parse import urlparse
 
 from app_identity import APP_STORAGE_NAME, SINGLE_INSTANCE_MUTEX
+from data_directory import (
+    application_dir,
+    legacy_data_dir,
+    migrate_legacy_data,
+    resolve_data_dir,
+)
+import data_directory
 from deepseek_pricing import configured_periods, parse_time_text
 
 APP_NAME = APP_STORAGE_NAME
@@ -90,12 +96,10 @@ FIELD_META: dict[str, dict[str, Any]] = {
 
 
 def app_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
+    return application_dir()
 
 
-DEFAULT_CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / APP_NAME
+DEFAULT_CONFIG_DIR = legacy_data_dir()
 LOCATION_PATH = DEFAULT_CONFIG_DIR / "location.json"
 _LOCATION_VERSION = 1
 
@@ -190,58 +194,29 @@ def validate_data_dir_target(value: str | os.PathLike[str]) -> Path:
 
 
 def _migrate_data_dir(source: Path, target: Path) -> None:
-    source = source.resolve(strict=False)
-    target = target.resolve(strict=False)
-    _validate_separate_dirs(source, target)
-    if source == target:
-        return
-    if not source.is_dir():
-        raise ValueError("原应用数据目录不存在")
-    target.mkdir(parents=True, exist_ok=True)
-    restoring_default = target == DEFAULT_CONFIG_DIR.resolve(strict=False)
-    target_entries = _data_entries(
-        target, exclude_migration_backups=restoring_default
-    )
-    if target_entries:
-        if not restoring_default:
-            raise ValueError("新的应用数据目录必须为空")
-        backup_dir = target / datetime.now().strftime("migration-backup-%Y%m%d-%H%M%S")
-        backup_dir.mkdir(parents=True, exist_ok=False)
-        for item in target_entries:
-            shutil.move(str(item), str(backup_dir / item.name))
-    for item in _data_entries(source, exclude_migration_backups=True):
-        destination = target / item.name
-        if item.is_dir():
-            shutil.copytree(item, destination)
-        else:
-            temp_path = destination.with_name(f".{destination.name}.migration.tmp")
-            shutil.copy2(item, temp_path)
-            temp_path.replace(destination)
-
-
-def _remove_migrated_data_dir(source: Path) -> None:
-    source = source.resolve(strict=False)
-    for item in _data_entries(source):
-        if item.is_dir():
-            shutil.rmtree(item)
-        else:
-            item.unlink()
-    if source != DEFAULT_CONFIG_DIR.resolve(strict=False):
-        source.rmdir()
+    migrate_legacy_data(source, target)
 
 
 def _initialize_data_dir() -> tuple[Path, dict[str, Any]]:
-    DEFAULT_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     state = _load_location_state()
-    try:
-        active_dir = _normalize_data_dir(
-            state.get("data_dir") or str(DEFAULT_CONFIG_DIR)
-        )
-    except ValueError:
-        active_dir = DEFAULT_CONFIG_DIR.resolve(strict=False)
-        state = {"data_dir": str(active_dir), "migration_error": "目录指针无效"}
-
     pending_value = state.get("pending_data_dir")
+    explicit_value = state.get("data_dir")
+    # 旧版本把默认 AppData 目录也写成显式位置；它仍属于待迁移的旧目录。
+    if explicit_value:
+        try:
+            normalized = _normalize_data_dir(explicit_value)
+            if normalized == DEFAULT_CONFIG_DIR.resolve(strict=False):
+                explicit_value = None
+        except ValueError:
+            explicit_value = None
+    try:
+        active_dir = resolve_data_dir(explicit_dir=explicit_value)
+        state = {"data_dir": str(active_dir)}
+    except (OSError, ValueError) as exc:
+        active_dir = DEFAULT_CONFIG_DIR.resolve(strict=False)
+        active_dir.mkdir(parents=True, exist_ok=True)
+        state = {"data_dir": str(active_dir), "migration_error": str(exc)}
+
     if pending_value and not _another_instance_running():
         source_dir = active_dir
         try:
@@ -257,16 +232,9 @@ def _initialize_data_dir() -> tuple[Path, dict[str, Any]]:
             except OSError:
                 pass
         else:
+            # 数据目录切换也保留原目录，避免迁移成功后立即失去回滚能力。
             active_dir = pending_dir
             state = next_state
-            try:
-                _remove_migrated_data_dir(source_dir)
-            except OSError as exc:
-                state = {**state, "migration_error": f"原应用数据目录清理失败：{exc}"}
-                try:
-                    _write_location_state(state)
-                except OSError:
-                    pass
 
     try:
         active_dir.mkdir(parents=True, exist_ok=True)
@@ -338,6 +306,12 @@ def logger() -> logging.Logger:
         log.setLevel(logging.INFO)
         log.propagate = False
         _logger_ready = True
+        log.info("Active data directory: %s", CONFIG_DIR)
+        if data_directory.LAST_MIGRATION_ERROR:
+            log.warning(
+                "Legacy data migration failed; legacy directory remains active: %s",
+                data_directory.LAST_MIGRATION_ERROR,
+            )
     return log
 
 
@@ -392,22 +366,19 @@ if os.name == "nt":
 
 
 def _credential_target(key: str) -> str:
-    return f"{APP_NAME}/{key}"
+    return f"TokenMeter/{key}"
 
 
-def _read_credential(key: str) -> str:
+def _read_credential_target(target: str) -> str:
+    """Read one target without logging its secret payload."""
+
     if os.name != "nt":
-        return os.environ.get(key, "")
+        return ""
     if _advapi32 is None:
         return ""
     pointer = ctypes.POINTER(_CREDENTIALW)()
     try:
-        if not _advapi32.CredReadW(
-            _credential_target(key),
-            _CREDENTIALW_TYPE,
-            0,
-            ctypes.byref(pointer),
-        ):
+        if not _advapi32.CredReadW(target, _CREDENTIALW_TYPE, 0, ctypes.byref(pointer)):
             return ""
         credential = pointer.contents
         if not credential.CredentialBlob or not credential.CredentialBlobSize:
@@ -422,6 +393,25 @@ def _read_credential(key: str) -> str:
                 _advapi32.CredFree(pointer)
             except Exception:
                 pass
+
+
+def _read_credential(key: str) -> str:
+    # E2E 安装测试必须加载真实程序，但不能读取当前用户的真实凭据或触发带凭据的网络请求。
+    if os.environ.get("TOKENMETER_E2E_DISABLE_CREDENTIALS") == "1":
+        return ""
+    if os.name != "nt":
+        return os.environ.get(key, "")
+    for prefix in ("TokenMeter", "TokenSpider", "TokenScope"):
+        value = _read_credential_target(f"{prefix}/{key}")
+        if value:
+            if prefix != "TokenMeter":
+                # 复制失败不影响本次继续使用旧凭据，且旧目标会一直保留。
+                try:
+                    _write_credential(key, value)
+                except OSError:
+                    pass
+            return value
+    return ""
 
 
 def _write_credential(key: str, value: str) -> None:

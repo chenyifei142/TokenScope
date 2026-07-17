@@ -1,4 +1,5 @@
 import os
+import hashlib
 from pathlib import Path
 
 os.environ["APPDATA"] = str(Path.cwd() / ".test-appdata")
@@ -7,7 +8,11 @@ import pytest
 from unittest.mock import Mock, patch
 
 from app_update import (
+    DownloadBundle,
+    DownloadedAsset,
     GITHUB_LATEST_RELEASE_API_URL,
+    GitHubReleaseClient,
+    UpdateError,
     _release_from_payload,
     _is_allowed_download_url,
     cleanup_pending_update,
@@ -15,6 +20,7 @@ from app_update import (
     format_bytes,
     is_safe_cleanup_path,
     normalize_version,
+    launch_installer,
     stable_target_path,
 )
 
@@ -28,111 +34,164 @@ def test_semver_comparison_supports_prefix_and_prerelease():
     assert compare_versions("1.2.0", "1.2.0-beta.1") > 0
 
 
-def test_release_asset_selection_prefers_tokenmeter_and_requires_updater():
-    release = _release_from_payload(
+def _setup_release(version="1.3.0"):
+    setup_name = f"TokenMeter-Setup-v{version}-x64.exe"
+    return _release_from_payload(
         {
-            "tag_name": "v1.3.0",
+            "tag_name": f"v{version}",
             "published_at": "2026-07-06T07:00:00Z",
             "body": "Bug fixes",
             "prerelease": False,
             "assets": [
                 {
-                    "name": "TokenScope-v1.3.0-windows-x64.exe",
-                    "browser_download_url": "https://github.com/zensoku142/TokenMeter/releases/download/v1.3.0/TokenScope-v1.3.0-windows-x64.exe",
-                    "size": 11,
-                },
-                {
-                    "name": "TokenSpider-v1.3.0-windows-x64.exe",
-                    "browser_download_url": "https://github.com/zensoku142/TokenMeter/releases/download/v1.3.0/TokenSpider-v1.3.0-windows-x64.exe",
-                    "size": 10,
-                },
-                {
-                    "name": "TokenMeter-v1.3.0-windows-x64.exe",
-                    "browser_download_url": "https://github.com/zensoku142/TokenMeter/releases/download/v1.3.0/TokenMeter-v1.3.0-windows-x64.exe",
+                    "name": setup_name,
+                    "browser_download_url": f"https://github.com/zensoku142/TokenMeter/releases/download/v{version}/{setup_name}",
                     "size": 12,
                 },
                 {
-                    "name": "TokenSpiderUpdater-v1.3.0-windows-x64.exe",
-                    "browser_download_url": "https://github.com/zensoku142/TokenMeter/releases/download/v1.3.0/TokenSpiderUpdater-v1.3.0-windows-x64.exe",
-                    "size": 5,
-                },
-                {
-                    "name": "TokenMeterUpdater-v1.3.0-windows-x64.exe",
-                    "browser_download_url": "https://github.com/zensoku142/TokenMeter/releases/download/v1.3.0/TokenMeterUpdater-v1.3.0-windows-x64.exe",
-                    "size": 6,
-                },
-                {
                     "name": "SHA256SUMS.txt",
-                    "browser_download_url": "https://github.com/zensoku142/TokenMeter/releases/download/v1.3.0/SHA256SUMS.txt",
+                    "browser_download_url": f"https://github.com/zensoku142/TokenMeter/releases/download/v{version}/SHA256SUMS.txt",
                     "size": 2,
                 },
             ],
         }
     )
 
+
+def test_release_asset_selection_requires_setup_installer():
+    release = _setup_release()
+
     assert release.version == "1.3.0"
-    assert release.app_asset.name == "TokenMeter-v1.3.0-windows-x64.exe"
-    assert release.updater_asset.name == "TokenMeterUpdater-v1.3.0-windows-x64.exe"
+    assert release.setup_asset.name == "TokenMeter-Setup-v1.3.0-x64.exe"
     assert release.checksum_asset.name == "SHA256SUMS.txt"
 
 
-def test_release_asset_selection_accepts_legacy_tokenscope_names():
-    release = _release_from_payload(
-        {
-            "tag_name": "v1.3.0",
-            "published_at": "2026-07-06T07:00:00Z",
-            "body": "Bug fixes",
-            "prerelease": False,
-            "assets": [
-                {
-                    "name": "TokenScope-v1.3.0-windows-x64.exe",
-                    "browser_download_url": "https://github.com/zensoku142/TokenMeter/releases/download/v1.3.0/TokenScope-v1.3.0-windows-x64.exe",
-                    "size": 11,
-                },
-                {
-                    "name": "TokenScopeUpdater-v1.3.0-windows-x64.exe",
-                    "browser_download_url": "https://github.com/zensoku142/TokenMeter/releases/download/v1.3.0/TokenScopeUpdater-v1.3.0-windows-x64.exe",
-                    "size": 5,
-                },
-                {
-                    "name": "SHA256SUMS.txt",
-                    "browser_download_url": "https://github.com/zensoku142/TokenMeter/releases/download/v1.3.0/SHA256SUMS.txt",
-                    "size": 2,
-                },
-            ],
-        }
+def test_release_without_setup_installer_is_rejected():
+    with pytest.raises(UpdateError, match="安装包"):
+        _release_from_payload(
+            {
+                "tag_name": "v1.3.0",
+                "assets": [
+                    {
+                        "name": "TokenMeter-v1.3.0-windows-x64.exe",
+                        "browser_download_url": "https://github.com/zensoku142/TokenMeter/releases/download/v1.3.0/TokenMeter-v1.3.0-windows-x64.exe",
+                        "size": 12,
+                    },
+                    {
+                        "name": "SHA256SUMS.txt",
+                        "browser_download_url": "https://github.com/zensoku142/TokenMeter/releases/download/v1.3.0/SHA256SUMS.txt",
+                        "size": 2,
+                    },
+                ],
+            }
+        )
+
+
+def test_download_bundle_downloads_only_verified_setup_to_update_cache(tmp_path):
+    release = _setup_release()
+    client = GitHubReleaseClient()
+    digest = "a" * 64
+    setup_path = tmp_path / "updates" / "v1.3.0" / release.setup_asset.name
+
+    def fake_download(asset, final_path, **kwargs):
+        assert asset == release.setup_asset
+        assert kwargs["expected_sha"] == digest
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+        final_path.write_bytes(b"setup")
+        return digest
+
+    with (
+        patch("app_update.config_manager.updates_dir", return_value=tmp_path / "updates"),
+        patch.object(client, "_load_checksums", return_value={release.setup_asset.name.lower(): digest}),
+        patch.object(client, "_download_asset", side_effect=fake_download) as download,
+    ):
+        bundle = client.download_bundle(release)
+
+    download.assert_called_once()
+    assert bundle.setup_asset.path == setup_path
+    assert bundle.setup_asset.sha256 == digest
+
+
+def test_download_bundle_rejects_checksum_manifest_without_setup(tmp_path):
+    release = _setup_release()
+    client = GitHubReleaseClient()
+    with (
+        patch("app_update.config_manager.updates_dir", return_value=tmp_path / "updates"),
+        patch.object(client, "_load_checksums", return_value={"other.exe": "a" * 64}),
+        patch.object(client, "_download_asset") as download,
+    ):
+        with pytest.raises(UpdateError, match="校验值"):
+            client.download_bundle(release)
+    download.assert_not_called()
+
+
+def test_launch_installer_uses_silent_update_parameters_and_original_install_dir(tmp_path):
+    release = _setup_release()
+    setup_path = tmp_path / "data" / "updates" / "v1.3.0" / release.setup_asset.name
+    setup_path.parent.mkdir(parents=True)
+    setup_path.write_bytes(b"setup")
+    current_exe = tmp_path / "Custom Install 目录" / "TokenMeter.exe"
+    bundle = DownloadBundle(
+        release=release,
+        setup_asset=DownloadedAsset(release.setup_asset, setup_path, hashlib.sha256(b"setup").hexdigest()),
+        cache_dir=setup_path.parent,
     )
 
-    assert release.app_asset.name == "TokenScope-v1.3.0-windows-x64.exe"
-    assert release.updater_asset.name == "TokenScopeUpdater-v1.3.0-windows-x64.exe"
+    with (
+        patch("app_update.sys.executable", str(current_exe)),
+        patch("app_update.config_manager.updates_dir", return_value=tmp_path / "data" / "updates"),
+        patch("app_update.config_manager.save_pending_update_cleanup") as save_cleanup,
+        patch("app_update.subprocess.Popen") as popen,
+    ):
+        launch_installer(bundle)
+
+    command = popen.call_args.args[0]
+    assert command == [
+        str(setup_path),
+        "/VERYSILENT",
+        "/SUPPRESSMSGBOXES",
+        "/NORESTART",
+        "/CLOSEAPPLICATIONS",
+        f"/DIR={current_exe.parent}",
+        "/TOKENMETERUPDATE",
+    ]
+    save_cleanup.assert_called_once()
 
 
-def test_release_asset_selection_accepts_legacy_tokenspider_names():
-    release = _release_from_payload(
-        {
-            "tag_name": "v1.3.0",
-            "assets": [
-                {
-                    "name": "TokenSpider-v1.3.0-windows-x64.exe",
-                    "browser_download_url": "https://github.com/zensoku142/TokenMeter/releases/download/v1.3.0/TokenSpider-v1.3.0-windows-x64.exe",
-                    "size": 10,
-                },
-                {
-                    "name": "TokenSpiderUpdater-v1.3.0-windows-x64.exe",
-                    "browser_download_url": "https://github.com/zensoku142/TokenMeter/releases/download/v1.3.0/TokenSpiderUpdater-v1.3.0-windows-x64.exe",
-                    "size": 5,
-                },
-                {
-                    "name": "SHA256SUMS.txt",
-                    "browser_download_url": "https://github.com/zensoku142/TokenMeter/releases/download/v1.3.0/SHA256SUMS.txt",
-                    "size": 2,
-                },
-            ],
-        }
+def test_installer_launch_failure_keeps_current_program_and_clears_cleanup_state(tmp_path):
+    release = _setup_release()
+    setup_path = tmp_path / "data" / "updates" / "v1.3.0" / release.setup_asset.name
+    setup_path.parent.mkdir(parents=True)
+    setup_path.write_bytes(b"setup")
+    current_exe = tmp_path / "TokenMeter" / "TokenMeter.exe"
+    current_exe.parent.mkdir()
+    current_exe.write_bytes(b"current-version")
+    bundle = DownloadBundle(
+        release=release,
+        setup_asset=DownloadedAsset(release.setup_asset, setup_path, "a" * 64),
+        cache_dir=setup_path.parent,
     )
+    clear = Mock()
 
-    assert release.app_asset.name.startswith("TokenSpider-")
-    assert release.updater_asset.name.startswith("TokenSpiderUpdater-")
+    with (
+        patch("app_update.sys.executable", str(current_exe)),
+        patch("app_update.config_manager.updates_dir", return_value=tmp_path / "data" / "updates"),
+        patch("app_update.config_manager.save_pending_update_cleanup"),
+        patch("app_update.config_manager.clear_pending_update_cleanup", clear),
+        patch("app_update.subprocess.Popen", side_effect=OSError("blocked")),
+    ):
+        with pytest.raises(UpdateError, match="安装包"):
+            launch_installer(bundle)
+
+    assert current_exe.read_bytes() == b"current-version"
+    clear.assert_called_once()
+
+
+def test_release_asset_selection_prefers_tokenmeter_and_requires_updater_removed():
+    """The old two-EXE protocol must not silently return through future refactors."""
+    release = _setup_release()
+    assert not hasattr(release, "app_asset")
+    assert not hasattr(release, "updater_asset")
 
 
 @pytest.mark.parametrize("name", ["TokenMeter.exe", "TokenSpider.exe", "TokenScope.exe"])

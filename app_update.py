@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -25,13 +24,9 @@ from app_identity import (
     GITHUB_LATEST_RELEASE_API_URL,
     GITHUB_RELEASES_API_URL,
     GITHUB_REPOSITORY,
-    LEGACY_MAIN_RELEASE_ASSET_TEMPLATES,
-    LEGACY_UPDATER_RELEASE_ASSET_TEMPLATES,
     MAIN_EXECUTABLE_NAME,
-    MAIN_RELEASE_ASSET_TEMPLATE,
+    SETUP_RELEASE_ASSET_TEMPLATE,
     SHA256_RELEASE_ASSET_NAME,
-    UPDATER_EXECUTABLE_NAME,
-    UPDATER_RELEASE_ASSET_TEMPLATE,
 )
 
 RELEASE_CHANNEL_STABLE = "stable"
@@ -45,12 +40,8 @@ _SEMVER_RE = re.compile(
     r"^v?(?P<major>0|[1-9]\d*)\.(?P<minor>0|[1-9]\d*)\.(?P<patch>0|[1-9]\d*)"
     r"(?:-(?P<prerelease>[0-9A-Za-z.-]+))?$"
 )
-_RELEASE_NAME_RE = re.compile(
-    r"^(?P<prefix>TokenMeter|TokenSpider|TokenScope)-v(?P<version>[0-9A-Za-z.-]+)-windows-x64\.exe$",
-    re.IGNORECASE,
-)
-_UPDATER_NAME_RE = re.compile(
-    r"^(?:TokenMeterUpdater|TokenSpiderUpdater|TokenScopeUpdater)-v(?P<version>[0-9A-Za-z.-]+)-windows-x64\.exe$",
+_SETUP_NAME_RE = re.compile(
+    r"^TokenMeter-Setup-v(?P<version>[0-9A-Za-z.-]+)-x64\.exe$",
     re.IGNORECASE,
 )
 _SHA256_LINE_RE = re.compile(r"^(?P<sha>[A-Fa-f0-9]{64})\s+\*?(?P<name>.+)$")
@@ -162,8 +153,7 @@ class ReleaseInfo:
     published_at: str
     body: str
     is_prerelease: bool
-    app_asset: ReleaseAsset
-    updater_asset: ReleaseAsset
+    setup_asset: ReleaseAsset
     checksum_asset: ReleaseAsset
 
 
@@ -186,8 +176,7 @@ class DownloadedAsset:
 @dataclass(frozen=True)
 class DownloadBundle:
     release: ReleaseInfo
-    app_asset: DownloadedAsset
-    updater_asset: DownloadedAsset
+    setup_asset: DownloadedAsset
     cache_dir: Path
 
 
@@ -368,53 +357,40 @@ class GitHubReleaseClient:
         cache_dir = config_manager.updates_dir() / f"v{release.version}"
         cache_dir.mkdir(parents=True, exist_ok=True)
         checksum_map = self._load_checksums(release)
-        app_expected = checksum_map.get(release.app_asset.name.lower())
-        updater_expected = checksum_map.get(release.updater_asset.name.lower())
-        if not app_expected or not updater_expected:
-            raise UpdateError("SHA256SUMS.txt 缺少主程序或更新器的校验值")
+        expected = checksum_map.get(release.setup_asset.name.lower())
+        if not expected:
+            raise UpdateError("SHA256SUMS.txt 缺少安装包的校验值")
 
-        total_size = sum(asset.size for asset in (release.app_asset, release.updater_asset))
-        bytes_done = 0
-        downloaded_assets: list[DownloadedAsset] = []
-        for asset, expected in (
-            (release.app_asset, app_expected),
-            (release.updater_asset, updater_expected),
-        ):
-            local_name = MAIN_EXECUTABLE_NAME if asset == release.app_asset else UPDATER_EXECUTABLE_NAME
-            final_path = cache_dir / local_name
-            existing = _validate_cached_file(final_path, expected)
-            if existing:
-                bytes_done += asset.size
-                downloaded_assets.append(DownloadedAsset(asset=asset, path=final_path, sha256=existing))
-                if progress:
-                    progress(
-                        {
-                            "stage": asset.name,
-                            "downloaded": bytes_done,
-                            "total": total_size,
-                            "current": asset.size,
-                            "current_total": asset.size,
-                            "speed": 0.0,
-                            "reused": True,
-                        }
-                    )
-                continue
+        asset = release.setup_asset
+        final_path = cache_dir / asset.name
+        actual_sha = _validate_cached_file(final_path, expected)
+        if actual_sha:
+            if progress:
+                progress(
+                    {
+                        "stage": asset.name,
+                        "downloaded": asset.size,
+                        "total": asset.size,
+                        "current": asset.size,
+                        "current_total": asset.size,
+                        "speed": 0.0,
+                        "reused": True,
+                    }
+                )
+        else:
             actual_sha = self._download_asset(
                 asset,
                 final_path,
                 expected_sha=expected,
-                bytes_before=bytes_done,
-                bytes_total=total_size,
+                bytes_before=0,
+                bytes_total=asset.size,
                 progress=progress,
                 cancel_requested=cancel_requested,
             )
-            bytes_done += asset.size
-            downloaded_assets.append(DownloadedAsset(asset=asset, path=final_path, sha256=actual_sha))
 
         return DownloadBundle(
             release=release,
-            app_asset=downloaded_assets[0],
-            updater_asset=downloaded_assets[1],
+            setup_asset=DownloadedAsset(asset=asset, path=final_path, sha256=actual_sha),
             cache_dir=cache_dir,
         )
 
@@ -570,12 +546,9 @@ class GitHubReleaseClient:
                 "latest_published_at": release.published_at,
                 "latest_body": release.body,
                 "latest_is_prerelease": release.is_prerelease,
-                "latest_app_asset_name": release.app_asset.name,
-                "latest_app_asset_url": release.app_asset.download_url,
-                "latest_app_asset_size": release.app_asset.size,
-                "latest_updater_asset_name": release.updater_asset.name,
-                "latest_updater_asset_url": release.updater_asset.download_url,
-                "latest_updater_asset_size": release.updater_asset.size,
+                "latest_setup_asset_name": release.setup_asset.name,
+                "latest_setup_asset_url": release.setup_asset.download_url,
+                "latest_setup_asset_size": release.setup_asset.size,
                 "latest_checksum_asset_name": release.checksum_asset.name,
                 "latest_checksum_asset_url": release.checksum_asset.download_url,
                 "latest_checksum_asset_size": release.checksum_asset.size,
@@ -583,16 +556,15 @@ class GitHubReleaseClient:
         )
 
 
-def launch_updater(bundle: DownloadBundle) -> None:
+def launch_installer(bundle: DownloadBundle) -> None:
     current_executable = Path(sys.executable).resolve()
-    target_path = stable_target_path(current_executable)
+    install_dir = current_executable.parent
     updates_root = config_manager.updates_dir().resolve(strict=False)
     cache_dir = bundle.cache_dir.resolve(strict=False)
     try:
         cleanup_paths = [str(cache_dir.relative_to(updates_root))]
     except ValueError as exc:
         raise UpdateError("更新缓存目录不在允许的清理范围内") from exc
-    cleanup_paths.append(str(target_path.with_suffix(target_path.suffix + ".bak")))
     config_manager.save_pending_update_cleanup(
         {
             "version": MANIFEST_VERSION,
@@ -600,25 +572,20 @@ def launch_updater(bundle: DownloadBundle) -> None:
         }
     )
     command = [
-        str(bundle.updater_asset.path),
-        "--wait-pid",
-        str(os.getpid()),
-        "--source",
-        str(bundle.app_asset.path),
-        "--target",
-        str(target_path),
-        "--current-exe",
-        str(current_executable),
-        "--log-path",
-        str(config_manager.UPDATER_LOG_PATH),
-        "--restart",
+        str(bundle.setup_asset.path),
+        "/VERYSILENT",
+        "/SUPPRESSMSGBOXES",
+        "/NORESTART",
+        "/CLOSEAPPLICATIONS",
+        f"/DIR={install_dir}",
+        "/TOKENMETERUPDATE",
     ]
     creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
         subprocess.Popen(command, close_fds=False, creationflags=creation_flags)
     except OSError as exc:
         config_manager.clear_pending_update_cleanup()
-        raise UpdateError("无法启动独立更新器") from exc
+        raise UpdateError("无法启动更新安装包") from exc
 
 
 def skipped_version() -> str:
@@ -670,15 +637,10 @@ def _release_from_state(state: dict[str, object]) -> ReleaseInfo | None:
     except ValueError:
         return None
     try:
-        app_asset = ReleaseAsset(
-            name=str(state["latest_app_asset_name"]),
-            download_url=str(state["latest_app_asset_url"]),
-            size=int(state.get("latest_app_asset_size", 0)),
-        )
-        updater_asset = ReleaseAsset(
-            name=str(state["latest_updater_asset_name"]),
-            download_url=str(state["latest_updater_asset_url"]),
-            size=int(state.get("latest_updater_asset_size", 0)),
+        setup_asset = ReleaseAsset(
+            name=str(state["latest_setup_asset_name"]),
+            download_url=str(state["latest_setup_asset_url"]),
+            size=int(state.get("latest_setup_asset_size", 0)),
         )
         checksum_asset = ReleaseAsset(
             name=str(state["latest_checksum_asset_name"]),
@@ -694,8 +656,7 @@ def _release_from_state(state: dict[str, object]) -> ReleaseInfo | None:
         published_at=str(state.get("latest_published_at") or ""),
         body=str(state.get("latest_body") or ""),
         is_prerelease=bool(state.get("latest_is_prerelease")),
-        app_asset=app_asset,
-        updater_asset=updater_asset,
+        setup_asset=setup_asset,
         checksum_asset=checksum_asset,
     )
 
@@ -710,8 +671,7 @@ def _release_from_payload(payload: object) -> ReleaseInfo:
     assets = payload.get("assets")
     if not isinstance(assets, list):
         raise UpdateError("Release 附件列表无效")
-    app_asset = _select_main_asset(version, assets)
-    updater_asset = _select_updater_asset(version, assets)
+    setup_asset = _select_setup_asset(version, assets)
     checksum_asset = _select_checksum_asset(assets)
     return ReleaseInfo(
         version=semver.normalized(),
@@ -720,8 +680,7 @@ def _release_from_payload(payload: object) -> ReleaseInfo:
         published_at=str(payload.get("published_at") or ""),
         body=str(payload.get("body") or "").strip(),
         is_prerelease=bool(payload.get("prerelease")),
-        app_asset=app_asset,
-        updater_asset=updater_asset,
+        setup_asset=setup_asset,
         checksum_asset=checksum_asset,
     )
 
@@ -738,52 +697,18 @@ def _release_version_from_payload(payload: dict[str, object]) -> str:
     raise UpdateError("Release 版本号不是有效的语义化版本")
 
 
-def _select_main_asset(version: str, assets: Iterable[object]) -> ReleaseAsset:
-    expected_names = [
-        MAIN_RELEASE_ASSET_TEMPLATE.format(version=version).lower(),
-        *(
-            template.format(version=version).lower()
-            for template in LEGACY_MAIN_RELEASE_ASSET_TEMPLATES
-        ),
-    ]
-    for name in expected_names:
-        for asset in assets:
-            candidate = _asset_from_payload(asset)
-            if candidate and candidate.name.lower() == name:
-                return candidate
+def _select_setup_asset(version: str, assets: Iterable[object]) -> ReleaseAsset:
+    expected_name = SETUP_RELEASE_ASSET_TEMPLATE.format(version=version).lower()
     for asset in assets:
         candidate = _asset_from_payload(asset)
         if not candidate:
             continue
-        match = _RELEASE_NAME_RE.match(candidate.name)
+        if candidate.name.lower() == expected_name:
+            return candidate
+        match = _SETUP_NAME_RE.match(candidate.name)
         if match and match.group("version").lower() == version.lower():
             return candidate
-    raise UpdateError("没有找到匹配的 Windows x64 主程序附件")
-
-
-def _select_updater_asset(version: str, assets: Iterable[object]) -> ReleaseAsset:
-    expected_names = [
-        UPDATER_RELEASE_ASSET_TEMPLATE.format(version=version).lower(),
-        *(
-            template.format(version=version).lower()
-            for template in LEGACY_UPDATER_RELEASE_ASSET_TEMPLATES
-        ),
-    ]
-    # Some existing releases may still carry the pre-rename updater asset name.
-    # Keep accepting it so old release metadata can still drive in-app updates.
-    for name in expected_names:
-        for asset in assets:
-            candidate = _asset_from_payload(asset)
-            if candidate and candidate.name.lower() == name:
-                return candidate
-    for asset in assets:
-        candidate = _asset_from_payload(asset)
-        if not candidate:
-            continue
-        match = _UPDATER_NAME_RE.match(candidate.name)
-        if match and match.group("version").lower() == version.lower():
-            return candidate
-    raise UpdateError("没有找到匹配的独立更新器附件")
+    raise UpdateError("没有找到匹配的 Windows x64 安装包")
 
 
 def _select_checksum_asset(assets: Iterable[object]) -> ReleaseAsset:

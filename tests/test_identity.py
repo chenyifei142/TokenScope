@@ -3,6 +3,7 @@ from app_identity import (
     APP_STORAGE_NAME,
     GITHUB_REPOSITORY,
     MAIN_EXECUTABLE_NAME,
+    SETUP_RELEASE_ASSET_TEMPLATE,
     SINGLE_INSTANCE_MUTEX,
     UPDATER_EXECUTABLE_NAME,
 )
@@ -12,6 +13,7 @@ def test_public_brand_uses_tokenmeter_names():
     assert APP_DISPLAY_NAME == "TokenMeter"
     assert MAIN_EXECUTABLE_NAME == "TokenMeter.exe"
     assert UPDATER_EXECUTABLE_NAME == "TokenMeterUpdater.exe"
+    assert SETUP_RELEASE_ASSET_TEMPLATE == "TokenMeter-Setup-v{version}-x64.exe"
     assert GITHUB_REPOSITORY == "zensoku142/TokenMeter"
 
 

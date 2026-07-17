@@ -83,15 +83,10 @@ def sample_release(version: str = "1.3.4") -> ReleaseInfo:
         published_at="2026-07-07T08:00:00Z",
         body="Bug fixes",
         is_prerelease=False,
-        app_asset=ReleaseAsset(
-            name=f"TokenMeter-v{version}-windows-x64.exe",
-            download_url=f"https://github.com/zensoku142/TokenMeter/releases/download/v{version}/TokenMeter-v{version}-windows-x64.exe",
-            size=10,
-        ),
-        updater_asset=ReleaseAsset(
-            name=f"TokenMeterUpdater-v{version}-windows-x64.exe",
-            download_url=f"https://github.com/zensoku142/TokenMeter/releases/download/v{version}/TokenMeterUpdater-v{version}-windows-x64.exe",
-            size=5,
+        setup_asset=ReleaseAsset(
+            name=f"TokenMeter-Setup-v{version}-x64.exe",
+            download_url=f"https://github.com/zensoku142/TokenMeter/releases/download/v{version}/TokenMeter-Setup-v{version}-x64.exe",
+            size=15,
         ),
         checksum_asset=ReleaseAsset(
             name="SHA256SUMS.txt",

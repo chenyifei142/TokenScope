@@ -43,7 +43,7 @@ TokenMeter は、DeepSeek と Xiaomi MiMo の Token 消費量、API コスト、
 
 ## ダウンロード
 
-[GitHub Releases](https://github.com/zensoku142/TokenMeter/releases/latest) から `TokenMeter-v{version}-windows-x64.exe` をダウンロードします。ポータブル版に Python は不要です。SmartScreen が表示された場合は `SHA256SUMS.txt` を照合してください。
+[GitHub Releases](https://github.com/zensoku142/TokenMeter/releases/latest) から `TokenMeter-Setup-vX.Y.Z-x64.exe` をダウンロードし、必要に応じて `SHA256SUMS.txt` を照合します。インストーラーで保存先を選択し、デスクトップまたはスタートメニューのショートカットから起動してください。既定の保存先は `%LOCALAPPDATA%\Programs\TokenMeter` です。
 
 ## クイックスタート
 
@@ -67,13 +67,11 @@ python main.py
 
 ## ローカルデータとプライバシー
 
-旧 TokenSpider との互換性のため、TokenMeter は現在も `%APPDATA%\TokenSpider` を既定のデータディレクトリとして使用します。Windows 資格情報のターゲットは `TokenSpider/` で始まり、単一インスタンス Mutex は `Local\TokenSpider.SingleInstance` のままなので、再ログインは不要です。このディレクトリを手動で削除・改名しないでください。将来 `%APPDATA%\TokenMeter` に移行する場合は、アプリが自動かつトランザクション方式で行う必要があります。
-
-主なファイルは `config.json`、`usage.db`、`widget-state.json`、`TokenSpider.log` です。設定から新しい空のローカルディレクトリへ、再起動後に全データを移せます。ネットワーク共有は非対応です。機密情報は `config.json` に書き込まれません。
+新規インストールでは `インストール先\data` にデータを保存します。旧 TokenSpider からの更新時は `%APPDATA%\TokenSpider` をコピーして設定と SQLite を検証し、成功後にのみ切り替えます。旧ディレクトリは移動・削除されず、失敗時もそのまま使用して起動します。資格情報は `TokenMeter/`、`TokenSpider/`、`TokenScope/` の順で Windows 資格情報マネージャーから読み取ります。
 
 ## 自動更新
 
-更新確認は `zensoku142/TokenMeter` の GitHub Releases を使用します。新しい添付名は `TokenMeter-*` で、旧 `TokenSpider-*` と `TokenScope-*` も認識します。`TokenSpider.exe` または `TokenScope.exe` からの更新は既存の安定パスを維持し、古いショートカットを保護します。バージョン付きファイルは `TokenMeter.exe` に移行します。
+更新時は `TokenMeter-Setup-vX.Y.Z-x64.exe` と `SHA256SUMS.txt` のみをダウンロードし、SHA256 検証後に元のインストール先へサイレント上書きします。固定 AppId により `data` とショートカットは維持され、失敗時は旧バージョンを同じショートカットから起動できます。アンインストールでは既定でプログラムとショートカットだけを削除し、`data` は残します。
 
 ## テスト
 
@@ -91,7 +89,7 @@ python -m pip install pyinstaller
 python scripts/build_release.py
 ```
 
-スクリプトは `dist\TokenMeter.exe`、`dist\TokenMeterUpdater.exe`、2 個のバージョン付き添付、`dist\SHA256SUMS.txt` を生成します。検証済み環境は Python 3.12、PyInstaller 6.21、PySide6 6.11 で、UPX は任意です。
+スクリプトは `dist\TokenMeter\` の onedir 構成を生成します。Inno Setup がある環境では `dist-installer\TokenMeter-Setup-vX.Y.Z-x64.exe` と `SHA256SUMS.txt` も生成します。
 
 ## プロジェクト構成
 
@@ -112,12 +110,12 @@ TokenMeter/
 - 未設定：設定でプロバイダーと資格情報を入力してください。
 - 資格情報の期限切れ：Cookie を再取得してください。MiMo は最初に専用ブラウザーセッションを試します。
 - レート制限：しばらく待ってから更新し、間隔を繰り返し短縮しないでください。
-- データが古い：`%APPDATA%\TokenSpider\TokenSpider.log` を確認してください。
+- データが古い：現在のデータディレクトリ（新規インストールでは通常 `インストール先\data`）にある `TokenSpider.log` を確認してください。
 - ウィンドウがない：システムトレイを確認してください。実行できるのは 1 インスタンスだけです。
 
 ## バージョンと Release
 
-現在のバージョン：`1.9.1`。変更履歴とチェックサムは [GitHub Releases](https://github.com/zensoku142/TokenMeter/releases) を参照してください。
+現在のバージョン：`1.10.0`。変更履歴とチェックサムは [GitHub Releases](https://github.com/zensoku142/TokenMeter/releases) を参照してください。
 
 ## License
 

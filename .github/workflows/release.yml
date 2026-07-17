@@ -24,8 +24,49 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt pyinstaller
 
-      - name: Build release artifacts
-        run: python scripts/build_release.py
+      - name: Run tests
+        run: python -m pytest -q
+
+      - name: Build PyInstaller onedir
+        run: python scripts/build_release.py --stage onedir
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Build Inno Setup installer
+        run: python scripts/build_release.py --stage installer --require-installer
+
+      - name: Smoke test onedir and installed application
+        shell: pwsh
+        run: |
+          python scripts/build_release.py --stage smoke
+          $setup = Resolve-Path "dist-installer/TokenMeter-Setup-v*-x64.exe"
+          $installDir = Join-Path $env:RUNNER_TEMP "TokenMeter Smoke Install"
+          $arguments = @(
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART",
+            "/NOICONS",
+            "/DIR=`"$installDir`""
+          )
+          $install = Start-Process $setup -ArgumentList $arguments -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "Installer exited with $($install.ExitCode)" }
+          New-Item -ItemType Directory -Force (Join-Path $installDir "data") | Out-Null
+          Set-Content (Join-Path $installDir "data/preserve-marker.txt") "keep"
+          $overwrite = Start-Process $setup -ArgumentList $arguments -Wait -PassThru
+          if ($overwrite.ExitCode -ne 0) { throw "Overwrite install exited with $($overwrite.ExitCode)" }
+          if (-not (Test-Path (Join-Path $installDir "data/preserve-marker.txt"))) {
+            throw "Overwrite install removed user data"
+          }
+          $app = Start-Process (Join-Path $installDir "TokenMeter.exe") -PassThru
+          Start-Sleep -Seconds 5
+          if ($app.HasExited -and $app.ExitCode -ne 0) {
+            throw "Installed TokenMeter exited with $($app.ExitCode)"
+          }
+          if (-not $app.HasExited) { Stop-Process -Id $app.Id -Force }
+
+      - name: Generate SHA256SUMS
+        run: python scripts/build_release.py --stage checksums --require-installer
 
       - name: Determine release channel
         id: channel
@@ -65,9 +106,8 @@ jobs:
           make_latest: ${{ steps.channel.outputs.make_latest }}
           body_path: ${{ steps.notes.outputs.body_path }}
           files: |
-            dist/TokenMeter-v*-windows-x64.exe
-            dist/TokenMeterUpdater-v*-windows-x64.exe
-            dist/SHA256SUMS.txt
+            dist-installer/TokenMeter-Setup-v*-x64.exe
+            dist-installer/SHA256SUMS.txt
 
       - name: Publish GitHub Release Without Body
         if: steps.notes.outputs.has_body != 'true'
@@ -79,6 +119,5 @@ jobs:
           prerelease: ${{ steps.channel.outputs.is_prerelease }}
           make_latest: ${{ steps.channel.outputs.make_latest }}
           files: |
-            dist/TokenMeter-v*-windows-x64.exe
-            dist/TokenMeterUpdater-v*-windows-x64.exe
-            dist/SHA256SUMS.txt
+            dist-installer/TokenMeter-Setup-v*-x64.exe
+            dist-installer/SHA256SUMS.txt

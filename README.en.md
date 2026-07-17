@@ -41,9 +41,11 @@ TokenMeter is a lightweight Windows desktop monitor for token usage, API costs, 
 > [!IMPORTANT]
 > Usage data depends on web-console endpoints; the MiMo Cookie must include `api-platform_ph`. Platform API or risk-control changes may temporarily affect data. Use only your own credentials and keep them secure.
 
-## Download
+## Installation
 
-Download `TokenMeter-v{version}-windows-x64.exe` from [GitHub Releases](https://github.com/zensoku142/TokenMeter/releases/latest). The portable build does not require Python. If SmartScreen warns, verify it against `SHA256SUMS.txt` first.
+1. Download `TokenMeter-Setup-vX.Y.Z-x64.exe` from [GitHub Releases](https://github.com/zensoku142/TokenMeter/releases/latest) and verify `SHA256SUMS.txt` when needed.
+2. Run the installer and choose an install directory. The default is `%LOCALAPPDATA%\Programs\TokenMeter`.
+3. Start TokenMeter from its desktop or Start menu shortcut.
 
 ## Quick start
 
@@ -67,13 +69,17 @@ python main.py
 
 ## Local data and privacy
 
-For compatibility with earlier TokenSpider versions, TokenMeter still uses `%APPDATA%\TokenSpider` as its default data directory. Windows Credential Manager targets still begin with `TokenSpider/`, and the single-instance mutex remains `Local\TokenSpider.SingleInstance`; users do not need to sign in again. Do not manually delete or rename this directory. Any future migration to `%APPDATA%\TokenMeter` must be automatic and transactional.
+New installations store data in `install directory\data`. When upgrading from TokenSpider, the app copies `%APPDATA%\TokenSpider`, validates configuration and SQLite data, and atomically switches only after validation. The old directory is never moved or deleted; a failed migration continues using it without blocking startup.
 
-Main files include `config.json`, `usage.db`, `widget-state.json`, and `TokenSpider.log`. Settings can move all data to a new empty local directory after restart; network shares are unsupported. Sensitive credentials are never written to `config.json`.
+Windows Credential Manager is read in `TokenMeter/`, `TokenSpider/`, then `TokenScope/` order. Secrets are never written to `config.json` or logs. Settings can also move data to a new empty local directory; network shares are unsupported.
 
 ## Automatic updates
 
-Update checks use GitHub Releases from `zensoku142/TokenMeter`. New assets use `TokenMeter-*`, while legacy `TokenSpider-*` and `TokenScope-*` assets remain recognized. Updates preserve the stable path when running as `TokenSpider.exe` or `TokenScope.exe`, keeping old shortcuts valid; versioned downloads migrate to `TokenMeter.exe`.
+Update checks use GitHub Releases from `zensoku142/TokenMeter`. The app downloads only `TokenMeter-Setup-vX.Y.Z-x64.exe` and `SHA256SUMS.txt`, verifies SHA256, and silently upgrades the existing install directory. The fixed AppId preserves `data` and shortcut targets. If installation fails, the previous version remains available from the same shortcut.
+
+## Uninstall
+
+By default, uninstall removes program files and shortcuts but keeps `data`. Delete that directory manually only after confirming its settings, history, and browser sessions are no longer needed.
 
 ## Testing
 
@@ -91,7 +97,7 @@ python -m pip install pyinstaller
 python scripts/build_release.py
 ```
 
-The release script produces `dist\TokenMeter.exe`, `dist\TokenMeterUpdater.exe`, two versioned assets, and `dist\SHA256SUMS.txt`. The verified release stack is Python 3.12, PyInstaller 6.21, and PySide6 6.11; UPX is optional.
+The release script produces the `dist\TokenMeter\` onedir tree. With Inno Setup installed it also creates `dist-installer\TokenMeter-Setup-vX.Y.Z-x64.exe` and `SHA256SUMS.txt`. The verified release stack is Python 3.12, PyInstaller 6.21, and PySide6 6.11; UPX is optional.
 
 ## Project structure
 
@@ -112,12 +118,12 @@ TokenMeter/
 - Not configured: select a provider and enter credentials in Settings.
 - Expired credentials: collect the Cookie again; MiMo first tries its dedicated browser session.
 - Rate limit or risk control: wait before refreshing and do not repeatedly shorten the interval.
-- Stale data: inspect `%APPDATA%\TokenSpider\TokenSpider.log`.
+- Stale data: inspect `TokenSpider.log` in the active data directory, normally `install directory\data` for a new installation.
 - No window: check the system tray; only one instance can run.
 
 ## Version and releases
 
-Current version: `1.9.1`. See [GitHub Releases](https://github.com/zensoku142/TokenMeter/releases) for change notes and checksums.
+Current version: `1.10.0`. See [GitHub Releases](https://github.com/zensoku142/TokenMeter/releases) for change notes and checksums.
 
 ## License
 
