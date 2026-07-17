@@ -177,7 +177,7 @@ def validate_data_dir_target(value: str | os.PathLike[str]) -> Path:
     if target == current:
         return target
     target.mkdir(parents=True, exist_ok=True)
-    probe_path = target / ".tokenscope-write-test"
+    probe_path = target / ".tokenmeter-write-test"
     try:
         probe_path.write_text("ok", encoding="utf-8")
         probe_path.unlink()
