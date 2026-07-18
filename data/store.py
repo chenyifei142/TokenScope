@@ -334,6 +334,18 @@ class TokenData:
                 last_attempt_at=datetime.now(),
             )
         provider = providers[0]
+        try:
+            reset_cache = getattr(provider, "reset_refresh_cache", None)
+            if reset_cache is not None:
+                reset_cache()
+            return cls._test_connection_with_provider(provider)
+        finally:
+            close = getattr(provider, "close", None)
+            if close is not None:
+                close()
+
+    @classmethod
+    def _test_connection_with_provider(cls, provider) -> "TokenData":
         per = PerProviderData(provider.id, provider.name, status="loading")
         successes = 0
         if not provider.is_configured():
@@ -385,9 +397,7 @@ class TokenData:
             return copy.deepcopy(snapshot) if snapshot else cls()
 
     @classmethod
-    def fetch(
-        cls, today: date | None = None, lightweight: bool = False
-    ) -> "TokenData":
+    def fetch(cls, today: date | None = None, lightweight: bool = False) -> "TokenData":
         providers = list(active_providers())
         if not providers:
             return cls(
@@ -395,8 +405,21 @@ class TokenData:
                 errors=[FetchError("NOT_CONFIGURED", "平台", "没有可用的数据平台")],
                 last_attempt_at=datetime.now(),
             )
-
         provider = providers[0]
+        try:
+            reset_cache = getattr(provider, "reset_refresh_cache", None)
+            if reset_cache is not None:
+                reset_cache()
+            return cls._fetch_with_provider(provider, today, lightweight)
+        finally:
+            close = getattr(provider, "close", None)
+            if close is not None:
+                close()
+
+    @classmethod
+    def _fetch_with_provider(
+        cls, provider, today: date | None = None, lightweight: bool = False
+    ) -> "TokenData":
         observed_at = provider_observed_at(provider.id, datetime.now().astimezone())
         current_day = today or observed_at.date()
         cached = cls._base_snapshot(provider.id)

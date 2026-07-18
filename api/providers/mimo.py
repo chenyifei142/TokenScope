@@ -101,6 +101,9 @@ class MiMoProvider(Provider):
         super().__init__(config)
         self._session = build_session()
 
+    def close(self) -> None:
+        self._session.close()
+
     # ------------------------------------------------------------------ helpers
     @staticmethod
     def normalize_cookie(raw: str) -> str:

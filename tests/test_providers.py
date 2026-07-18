@@ -158,6 +158,22 @@ class DeepSeekProviderTests(unittest.TestCase):
         self.assertIsNot(first._platform_session, second._platform_session)
         self.assertIsNot(first._official_session, second._official_session)
 
+    @patch("api.providers.deepseek.official_api.build_session")
+    @patch("api.providers.deepseek.platform_api.build_session")
+    def test_close_releases_both_sessions(
+        self, build_platform_session, build_official_session
+    ):
+        platform_session = Mock()
+        official_session = Mock()
+        build_platform_session.return_value = platform_session
+        build_official_session.return_value = official_session
+
+        provider = DeepSeekProvider()
+        provider.close()
+
+        platform_session.close.assert_called_once_with()
+        official_session.close.assert_called_once_with()
+
     @patch("api.providers.deepseek.config_manager.get")
     @patch("api.providers.deepseek.platform_api.get_usage_cost")
     @patch("api.providers.deepseek.platform_api.get_usage_amount")

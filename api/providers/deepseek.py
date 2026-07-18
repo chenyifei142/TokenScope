@@ -137,10 +137,18 @@ class DeepSeekProvider(Provider):
         super().__init__(config)
         self._summary_cache: dict[str, Any] | None = None
         self._summary_error: Exception | None = None
-        # A settings test gets dedicated sessions so response cookies and adapter
-        # state cannot be shared with a concurrent background refresh.
-        self._platform_session = platform_api.build_session() if config is not None else None
-        self._official_session = official_api.build_session() if config is not None else None
+        # 每个 Provider 独占 Cookie 和连接池，设置测试不能污染后台刷新会话。
+        self._platform_session = platform_api.build_session()
+        self._official_session = official_api.build_session()
+
+    def reset_refresh_cache(self) -> None:
+        # 摘要仅在同一轮余额与摘要读取间复用；上一轮异常也不能污染下一轮。
+        self._summary_cache = None
+        self._summary_error = None
+
+    def close(self) -> None:
+        self._platform_session.close()
+        self._official_session.close()
 
     @staticmethod
     def acquired_cookie_values(cookie: str) -> dict[str, str]:
@@ -193,12 +201,8 @@ class DeepSeekProvider(Provider):
         # 同一轮余额和摘要共用一次平台请求，避免无 API Key 时重复拉取摘要。
         if self._summary_cache is None and self._summary_error is None:
             try:
-                self._summary_cache = (
-                    platform_api.get_user_summary(
-                        self._config, session=self._platform_session
-                    )
-                    if self._config is not None
-                    else platform_api.get_user_summary()
+                self._summary_cache = platform_api.get_user_summary(
+                    self._config, session=self._platform_session
                 )
             except Exception as exc:
                 self._summary_error = exc
@@ -209,12 +213,8 @@ class DeepSeekProvider(Provider):
     def fetch_balance(self) -> tuple[ProviderBalance | None, FetchError | None]:
         if str(self.config_get("DEEPSEEK_API_KEY", "")).strip():
             try:
-                payload = (
-                    official_api.get_balance(
-                        self._config, session=self._official_session
-                    )
-                    if self._config is not None
-                    else official_api.get_balance()
+                payload = official_api.get_balance(
+                    self._config, session=self._official_session
                 )
                 infos = payload.get("balance_infos", [])
                 if not isinstance(infos, list):
@@ -275,22 +275,14 @@ class DeepSeekProvider(Provider):
             amount_data: dict[str, Any] | None = None
             cost_data: dict[str, Any] | None = None
             try:
-                amount_data = (
-                    platform_api.get_usage_amount(
-                        month, year, self._config, session=self._platform_session
-                    )
-                    if self._config is not None
-                    else platform_api.get_usage_amount(month, year)
+                amount_data = platform_api.get_usage_amount(
+                    month, year, self._config, session=self._platform_session
                 )
             except Exception as exc:
                 errors.append(_fetch_error("Token 明细", exc))
             try:
-                cost_data = (
-                    platform_api.get_usage_cost(
-                        month, year, self._config, session=self._platform_session
-                    )
-                    if self._config is not None
-                    else platform_api.get_usage_cost(month, year)
+                cost_data = platform_api.get_usage_cost(
+                    month, year, self._config, session=self._platform_session
                 )
             except Exception as exc:
                 errors.append(_fetch_error("费用明细", exc))

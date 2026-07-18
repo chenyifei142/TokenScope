@@ -104,6 +104,12 @@ class Provider:
                 return True
         return False
 
+    def reset_refresh_cache(self) -> None:
+        """Reset data that is valid only within one refresh task."""
+
+    def close(self) -> None:
+        """Release provider-owned resources."""
+
     def fetch_balance(self) -> tuple[ProviderBalance | None, FetchError | None]:
         return None, None
 

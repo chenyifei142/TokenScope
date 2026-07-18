@@ -108,6 +108,23 @@ class StoreTests(unittest.TestCase):
         self.assertIs(TokenData._last_snapshot, existing)
         self.assertEqual(result.status, "ok")
 
+    def test_refresh_closes_provider_after_network_failure(self):
+        class ClosingProvider(FakeProvider):
+            def __init__(self):
+                super().__init__()
+                self.closed = False
+
+            def fetch_balance(self):
+                raise RuntimeError("network failed")
+
+            def close(self):
+                self.closed = True
+
+        provider = ClosingProvider()
+        self.fetch_with(provider)
+
+        self.assertTrue(provider.closed)
+
     def test_dynamic_models_merge_remainder(self):
         stats = {
             "a": ModelUsage("a", 30, Decimal(".3")),

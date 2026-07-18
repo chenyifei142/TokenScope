@@ -36,7 +36,7 @@ def get_provider(provider_id: str, config: Mapping[str, Any] | None = None) -> P
 def list_providers() -> list[tuple[str, str]]:
     """Return ``(id, display_name)`` for every registered provider, preserving
     registration order."""
-    return [(provider.id, provider.name) for provider in (cls() for cls in PROVIDERS.values())]
+    return [(provider.id, provider.name) for provider in PROVIDERS.values()]
 
 
 def active_providers(config: Mapping[str, Any] | None = None) -> Iterator[Provider]:
